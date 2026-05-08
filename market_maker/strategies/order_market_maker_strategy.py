@@ -5,6 +5,7 @@ from vnpy_ctastrategy import (
     OrderData,
     StopOrder,
 )
+import math
 
 class MarketDataManager:
     def __init__(self) -> None:
@@ -170,6 +171,8 @@ class MarketDataManager:
             + self.bid1 * self.ask1_volume
         ) / total_volume
 
+
+#定价可能包含单基准价 或者多基准价，都有可能 目前因该是为了方便 所以用的应该是单基准价
 class PricingEngine:
     def __init__(self) -> None:
         self.mid_price: float = 0.0
@@ -259,7 +262,7 @@ class PricingEngine:
     def calculate_fair_price(
         self,
         snapshot: dict,
-        pricing_method: str,
+        pricing_method: str = "mid",
         depth: int = 5
     ) -> float:
         if pricing_method == "mid":
@@ -286,9 +289,241 @@ class PricingEngine:
         return round(price / price_tick) * price_tick
 
 
+
+
+
 class QuoteEngine:
-    """报价模块"""
-    pass
+    def __init__(self) -> None:
+        self.current_buy_quotes: list[dict] = []
+        self.current_sell_quotes: list[dict] = []
+
+    def generate_quotes(
+        self,
+        fair_price: float,
+        price_tick: float,
+        quote_levels: int,
+        order_volume: float,
+        quote_mode: str = "tick",
+        spread_tick: int = 1,
+        level_interval_tick: int = 1,
+        spread_percent: float = 0.0002,
+        level_interval_percent: float = 0.0001,
+        split_count: int = 1,
+        snapshot: dict | None = None,
+        passive: bool = True,
+    ) -> tuple[list[dict], list[dict]]:
+        if fair_price <= 0:
+            return [], []
+
+        if price_tick <= 0:
+            return [], []
+
+        if quote_levels <= 0:
+            return [], []
+
+        if order_volume <= 0:
+            return [], []
+
+        if split_count <= 0:
+            return [], []
+
+        quote_levels = min(quote_levels, 5)
+
+        buy_quotes: list[dict] = []
+        sell_quotes: list[dict] = []
+
+        for level in range(1, quote_levels + 1):
+            if quote_mode == "tick":
+                buy_price, sell_price, offset_value = self._calculate_tick_quote_price(
+                    fair_price=fair_price,
+                    price_tick=price_tick,
+                    level=level,
+                    spread_tick=spread_tick,
+                    level_interval_tick=level_interval_tick,
+                )
+
+            elif quote_mode == "percent":
+                buy_price, sell_price, offset_value = self._calculate_percent_quote_price(
+                    fair_price=fair_price,
+                    price_tick=price_tick,
+                    level=level,
+                    spread_percent=spread_percent,
+                    level_interval_percent=level_interval_percent,
+                )
+
+            else:
+                buy_price, sell_price, offset_value = self._calculate_tick_quote_price(
+                    fair_price=fair_price,
+                    price_tick=price_tick,
+                    level=level,
+                    spread_tick=spread_tick,
+                    level_interval_tick=level_interval_tick,
+                )
+
+            if passive and snapshot:
+                bid1 = snapshot["bid1"]
+                ask1 = snapshot["ask1"]
+
+                if bid1 > 0:
+                    buy_price = min(buy_price, bid1)
+
+                if ask1 > 0:
+                    sell_price = max(sell_price, ask1)
+
+            if buy_price <= 0 or sell_price <= 0:
+                continue
+
+            for order_index in range(1, split_count + 1):
+                buy_quotes.append(
+                    {
+                        "side": "buy",
+                        "level": level,
+                        "order_index": order_index,
+                        "price": buy_price,
+                        "volume": order_volume,
+                        "quote_mode": quote_mode,
+                        "offset_value": offset_value,
+                    }
+                )
+
+                sell_quotes.append(
+                    {
+                        "side": "sell",
+                        "level": level,
+                        "order_index": order_index,
+                        "price": sell_price,
+                        "volume": order_volume,
+                        "quote_mode": quote_mode,
+                        "offset_value": offset_value,
+                    }
+                )
+
+        return buy_quotes, sell_quotes
+
+    def _calculate_tick_quote_price(
+        self,
+        fair_price: float,
+        price_tick: float,
+        level: int,
+        spread_tick: int,
+        level_interval_tick: int,
+    ) -> tuple[float, float, float]:
+        if spread_tick < 0:
+            spread_tick = 0
+
+        if level_interval_tick <= 0:
+            level_interval_tick = 1
+
+        offset_tick = spread_tick + (level - 1) * level_interval_tick
+
+        raw_buy_price = fair_price - offset_tick * price_tick
+        raw_sell_price = fair_price + offset_tick * price_tick
+
+        buy_price = self.floor_to_tick(raw_buy_price, price_tick)
+        sell_price = self.ceil_to_tick(raw_sell_price, price_tick)
+
+        return buy_price, sell_price, float(offset_tick)
+
+    def _calculate_percent_quote_price(
+        self,
+        fair_price: float,
+        price_tick: float,
+        level: int,
+        spread_percent: float,
+        level_interval_percent: float,
+    ) -> tuple[float, float, float]:
+        if spread_percent < 0:
+            spread_percent = 0.0
+
+        if level_interval_percent < 0:
+            level_interval_percent = 0.0
+
+        offset_percent = spread_percent + (level - 1) * level_interval_percent
+
+        raw_buy_price = fair_price * (1 - offset_percent)
+        raw_sell_price = fair_price * (1 + offset_percent)
+
+        buy_price = self.floor_to_tick(raw_buy_price, price_tick)
+        sell_price = self.ceil_to_tick(raw_sell_price, price_tick)
+
+        return buy_price, sell_price, offset_percent
+
+    def floor_to_tick(self, price: float, price_tick: float) -> float:
+        if price_tick <= 0:
+            return price
+
+        return math.floor(price / price_tick) * price_tick
+
+    def ceil_to_tick(self, price: float, price_tick: float) -> float:
+        if price_tick <= 0:
+            return price
+
+        return math.ceil(price / price_tick) * price_tick
+
+    def round_to_tick(self, price: float, price_tick: float) -> float:
+        if price_tick <= 0:
+            return price
+
+        return round(price / price_tick) * price_tick
+
+    def need_requote(
+        self,
+        new_buy_quotes: list[dict],
+        new_sell_quotes: list[dict],
+        price_tick: float,
+        update_tolerance: int,
+    ) -> bool:
+        if price_tick <= 0:
+            return False
+
+        if update_tolerance < 0:
+            update_tolerance = 0
+
+        tolerance_price = update_tolerance * price_tick
+
+        if len(new_buy_quotes) != len(self.current_buy_quotes):
+            return True
+
+        if len(new_sell_quotes) != len(self.current_sell_quotes):
+            return True
+
+        for old_quote, new_quote in zip(self.current_buy_quotes, new_buy_quotes):
+            old_price = old_quote["price"]
+            new_price = new_quote["price"]
+            old_volume = old_quote["volume"]
+            new_volume = new_quote["volume"]
+
+            if abs(new_price - old_price) > tolerance_price:
+                return True
+
+            if new_volume != old_volume:
+                return True
+
+        for old_quote, new_quote in zip(self.current_sell_quotes, new_sell_quotes):
+            old_price = old_quote["price"]
+            new_price = new_quote["price"]
+            old_volume = old_quote["volume"]
+            new_volume = new_quote["volume"]
+
+            if abs(new_price - old_price) > tolerance_price:
+                return True
+
+            if new_volume != old_volume:
+                return True
+
+        return False
+
+    def update_current_quotes(
+        self,
+        buy_quotes: list[dict],
+        sell_quotes: list[dict],
+    ) -> None:
+        self.current_buy_quotes = [quote.copy() for quote in buy_quotes]
+        self.current_sell_quotes = [quote.copy() for quote in sell_quotes]
+
+    def clear_current_quotes(self) -> None:
+        self.current_buy_quotes = []
+        self.current_sell_quotes = []
 
 
 class InventorySkewEngine:
