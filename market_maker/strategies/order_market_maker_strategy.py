@@ -527,13 +527,280 @@ class QuoteEngine:
 
 
 class InventorySkewEngine:
-    """库存偏移/软对冲模块"""
-    pass
+    def __init__(self) -> None:
+        self.last_skew_tick: int = 0
+        self.last_pos_ratio: float = 0.0
+
+    def apply_skew(
+        self,
+        buy_quotes: list[dict],
+        sell_quotes: list[dict],
+        pos: float,
+        max_position: float,
+        price_tick: float,
+        max_skew_tick: int = 3,
+        snapshot: dict | None = None,
+        passive: bool = True,
+    ) -> tuple[list[dict], list[dict]]:
+        if not buy_quotes and not sell_quotes:
+            return buy_quotes, sell_quotes
+
+        if max_position <= 0:
+            return buy_quotes, sell_quotes
+
+        if price_tick <= 0:
+            return buy_quotes, sell_quotes
+
+        if max_skew_tick <= 0:
+            self.last_skew_tick = 0
+            self.last_pos_ratio = 0.0
+            return buy_quotes, sell_quotes
+
+        pos_ratio = self.calculate_pos_ratio(pos, max_position)
+        skew_tick = self.calculate_skew_tick(pos_ratio, max_skew_tick)
+
+        self.last_pos_ratio = pos_ratio
+        self.last_skew_tick = skew_tick
+
+        adjusted_buy_quotes = [quote.copy() for quote in buy_quotes]
+        adjusted_sell_quotes = [quote.copy() for quote in sell_quotes]
+
+        if skew_tick > 0:
+            if pos > 0:
+                adjusted_buy_quotes = self.move_quotes(
+                    quotes=adjusted_buy_quotes,
+                    price_tick=price_tick,
+                    skew_tick=-skew_tick,
+                )
+                adjusted_sell_quotes = self.move_quotes(
+                    quotes=adjusted_sell_quotes,
+                    price_tick=price_tick,
+                    skew_tick=-skew_tick,
+                )
+
+            elif pos < 0:
+                adjusted_buy_quotes = self.move_quotes(
+                    quotes=adjusted_buy_quotes,
+                    price_tick=price_tick,
+                    skew_tick=skew_tick,
+                )
+                adjusted_sell_quotes = self.move_quotes(
+                    quotes=adjusted_sell_quotes,
+                    price_tick=price_tick,
+                    skew_tick=skew_tick,
+                )
+
+        if passive and snapshot:
+            adjusted_buy_quotes, adjusted_sell_quotes = self.apply_passive_limit(
+                buy_quotes=adjusted_buy_quotes,
+                sell_quotes=adjusted_sell_quotes,
+                snapshot=snapshot,
+            )
+
+        return adjusted_buy_quotes, adjusted_sell_quotes
+
+    def calculate_pos_ratio(
+        self,
+        pos: float,
+        max_position: float,
+    ) -> float:
+        if max_position <= 0:
+            return 0.0
+
+        pos_ratio = pos / max_position
+
+        if pos_ratio > 1:
+            return 1.0
+
+        if pos_ratio < -1:
+            return -1.0
+
+        return pos_ratio
+
+    def calculate_skew_tick(
+        self,
+        pos_ratio: float,
+        max_skew_tick: int,
+    ) -> int:
+        if max_skew_tick <= 0:
+            return 0
+
+        return round(abs(pos_ratio) * max_skew_tick)
+
+    def move_quotes(
+        self,
+        quotes: list[dict],
+        price_tick: float,
+        skew_tick: int,
+    ) -> list[dict]:
+        adjusted_quotes: list[dict] = []
+
+        for quote in quotes:
+            adjusted_quote = quote.copy()
+            adjusted_price = adjusted_quote["price"] + skew_tick * price_tick
+
+            if adjusted_price <= 0:
+                continue
+
+            adjusted_quote["price"] = adjusted_price
+            adjusted_quote["skew_tick"] = skew_tick
+
+            adjusted_quotes.append(adjusted_quote)
+
+        return adjusted_quotes
+
+    def apply_passive_limit(
+        self,
+        buy_quotes: list[dict],
+        sell_quotes: list[dict],
+        snapshot: dict,
+    ) -> tuple[list[dict], list[dict]]:
+        bid1 = snapshot["bid1"]
+        ask1 = snapshot["ask1"]
+
+        adjusted_buy_quotes: list[dict] = []
+        adjusted_sell_quotes: list[dict] = []
+
+        for quote in buy_quotes:
+            adjusted_quote = quote.copy()
+
+            if bid1 > 0:
+                adjusted_quote["price"] = min(adjusted_quote["price"], bid1)
+
+            adjusted_buy_quotes.append(adjusted_quote)
+
+        for quote in sell_quotes:
+            adjusted_quote = quote.copy()
+
+            if ask1 > 0:
+                adjusted_quote["price"] = max(adjusted_quote["price"], ask1)
+
+            adjusted_sell_quotes.append(adjusted_quote)
+
+        return adjusted_buy_quotes, adjusted_sell_quotes
+
+    def get_last_skew_tick(self) -> int:
+        return self.last_skew_tick
+
+    def get_last_pos_ratio(self) -> float:
+        return self.last_pos_ratio
 
 
 class HedgeEngine:
-    """主动对冲模块"""
-    pass
+    def __init__(self) -> None:
+        self.last_hedge_action: str = ""
+        self.last_hedge_price: float = 0.0
+        self.last_hedge_volume: float = 0.0
+
+    def check_hedge(
+        self,
+        pos: float,
+        hedge_threshold: float,
+        hedge_volume: float,
+        price_tick: float,
+        snapshot: dict,
+        hedge_price_tick: int = 1,
+    ) -> dict | None:
+        if hedge_threshold <= 0:
+            return None
+
+        if hedge_volume <= 0:
+            return None
+
+        if price_tick <= 0:
+            return None
+
+        bid1 = snapshot["bid1"]
+        ask1 = snapshot["ask1"]
+
+        if bid1 <= 0 or ask1 <= 0 or ask1 <= bid1:
+            return None
+
+        if pos >= hedge_threshold:
+            price = self.calculate_sell_close_price(
+                bid1=bid1,
+                price_tick=price_tick,
+                hedge_price_tick=hedge_price_tick,
+            )
+
+            volume = min(abs(pos), hedge_volume)
+
+            hedge_order = {
+                "action": "SELL_CLOSE",
+                "price": price,
+                "volume": volume,
+                "reason": "long_position_exceed_threshold",
+            }
+
+            self.update_last_hedge(hedge_order)
+            return hedge_order
+
+        if pos <= -hedge_threshold:
+            price = self.calculate_buy_close_price(
+                ask1=ask1,
+                price_tick=price_tick,
+                hedge_price_tick=hedge_price_tick,
+            )
+
+            volume = min(abs(pos), hedge_volume)
+
+            hedge_order = {
+                "action": "BUY_CLOSE",
+                "price": price,
+                "volume": volume,
+                "reason": "short_position_exceed_threshold",
+            }
+
+            self.update_last_hedge(hedge_order)
+            return hedge_order
+
+        return None
+
+    def calculate_sell_close_price(
+        self,
+        bid1: float,
+        price_tick: float,
+        hedge_price_tick: int = 1,
+    ) -> float:
+        if hedge_price_tick < 0:
+            hedge_price_tick = 0
+
+        price = bid1 - hedge_price_tick * price_tick
+
+        if price <= 0:
+            return bid1
+
+        return price
+
+    def calculate_buy_close_price(
+        self,
+        ask1: float,
+        price_tick: float,
+        hedge_price_tick: int = 1,
+    ) -> float:
+        if hedge_price_tick < 0:
+            hedge_price_tick = 0
+
+        return ask1 + hedge_price_tick * price_tick
+
+    def update_last_hedge(self, hedge_order: dict) -> None:
+        self.last_hedge_action = hedge_order["action"]
+        self.last_hedge_price = hedge_order["price"]
+        self.last_hedge_volume = hedge_order["volume"]
+
+    def clear_last_hedge(self) -> None:
+        self.last_hedge_action = ""
+        self.last_hedge_price = 0.0
+        self.last_hedge_volume = 0.0
+
+    def get_last_hedge_action(self) -> str:
+        return self.last_hedge_action
+
+    def get_last_hedge_price(self) -> float:
+        return self.last_hedge_price
+
+    def get_last_hedge_volume(self) -> float:
+        return self.last_hedge_volume
 
 class QuoteRiskFilter:
     def check_market_data(self, snapshot: dict) -> bool:
