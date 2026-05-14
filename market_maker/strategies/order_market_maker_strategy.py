@@ -186,7 +186,21 @@ class PricingEngine:
         self.mid_price: float = 0.0
         self.micro_price: float = 0.0
         self.depth_weighted_mid: float = 0.0
+        self.exp_weighted_depth_mid: float = 0.0
+
+        self.ema_fair_price: float = 0.0
         self.fair_price: float = 0.0
+
+        self.ema_alpha: float = 0.2
+
+    def reset(self) -> None:
+        """重置定价引擎状态，尤其是 EMA 状态"""
+        self.mid_price = 0.0
+        self.micro_price = 0.0
+        self.depth_weighted_mid = 0.0
+        self.exp_weighted_depth_mid = 0.0
+        self.ema_fair_price = 0.0
+        self.fair_price = 0.0
 
     #计算中价，
     def calculate_mid_price(self, snapshot: dict) -> float:
@@ -263,24 +277,173 @@ class PricingEngine:
         self.depth_weighted_mid = (weighted_bid + weighted_ask) / 2
 
         return self.depth_weighted_mid
-    #三选一的方式去决定我们的基准价格，目前为单一基准价。
-    def calculate_fair_price(self,snapshot: dict,pricing_method: str = "mid",depth: int = 5) -> float:
-        #三选一的定价基准价的方式
+
+    # ==================== 新增：指数加权五档基准价 ====================
+
+    def calculate_exp_weighted_depth_mid(
+            self,
+            snapshot: dict,
+            depth: int = 5,
+            decay: float = 0.6,
+    ) -> float:
+        """
+        指数加权五档中间价。
+
+        近端盘口权重更高：
+        第1档权重 = 1
+        第2档权重 = decay
+        第3档权重 = decay^2
+        ...
+        """
+
+        bid_prices = snapshot["bid_prices"]
+        ask_prices = snapshot["ask_prices"]
+        bid_volumes = snapshot["bid_volumes"]
+        ask_volumes = snapshot["ask_volumes"]
+        valid_depth = snapshot["valid_depth"]
+
+        depth = min(depth, valid_depth, 5)
+
+        if depth <= 0:
+            return 0.0
+
+        # decay 做保护，避免乱填
+        if decay <= 0:
+            decay = 0.6
+
+        if decay > 1:
+            decay = 1.0
+
+        bid_amount = 0.0
+        ask_amount = 0.0
+        bid_volume_sum = 0.0
+        ask_volume_sum = 0.0
+
+        weight = 1.0
+
+        for i in range(depth):
+            bid_price = bid_prices[i]
+            ask_price = ask_prices[i]
+            bid_volume = bid_volumes[i]
+            ask_volume = ask_volumes[i]
+
+            if bid_price <= 0 or ask_price <= 0:
+                continue
+
+            if bid_volume <= 0 or ask_volume <= 0:
+                continue
+
+            bid_amount += bid_price * bid_volume * weight
+            ask_amount += ask_price * ask_volume * weight
+            bid_volume_sum += bid_volume * weight
+            ask_volume_sum += ask_volume * weight
+
+            weight *= decay
+
+        if bid_volume_sum <= 0 or ask_volume_sum <= 0:
+            return self.calculate_depth_weighted_mid(snapshot, depth)
+
+        weighted_bid = bid_amount / bid_volume_sum
+        weighted_ask = ask_amount / ask_volume_sum
+
+        self.exp_weighted_depth_mid = (weighted_bid + weighted_ask) / 2
+
+        return self.exp_weighted_depth_mid
+
+    # ==================== 新增：EMA 平滑 ====================
+
+    def apply_ema_smoothing(
+        self,
+        new_price: float,
+        ema_alpha: float = 0.2,
+    ) -> float:
+        """
+        对 fair_price 做 EMA 平滑。
+
+        ema_alpha 越大，越跟随最新价格；
+        ema_alpha 越小，越平滑。
+        """
+
+        if new_price <= 0:
+            return new_price
+
+        if ema_alpha <= 0:
+            return new_price
+
+        if ema_alpha > 1:
+            ema_alpha = 1.0
+
+        if self.ema_fair_price <= 0:
+            self.ema_fair_price = new_price
+        else:
+            self.ema_fair_price = (
+                ema_alpha * new_price
+                + (1 - ema_alpha) * self.ema_fair_price
+            )
+
+        return self.ema_fair_price
+
+    def calculate_fair_price(
+            self,
+            snapshot: dict,
+            pricing_method: str = "exp_depth_weighted",
+            depth: int = 5,
+            exp_depth_decay: float = 0.6,
+            use_ema_smoothing: bool = False,
+            ema_alpha: float = 0.2,
+    ) -> float:
+        """
+        计算最终基准价。
+
+        pricing_method:
+            mid
+            micro
+            depth_weighted
+            exp_depth_weighted
+
+        use_ema_smoothing:
+            是否对最终基准价做 EMA 平滑
+        """
+
         if pricing_method == "mid":
-            self.fair_price = self.calculate_mid_price(snapshot)
+            raw_price = self.calculate_mid_price(snapshot)
 
         elif pricing_method == "micro":
-            self.fair_price = self.calculate_micro_price(snapshot)
+            raw_price = self.calculate_micro_price(snapshot)
 
         elif pricing_method == "depth_weighted":
-            self.fair_price = self.calculate_depth_weighted_mid(
+            raw_price = self.calculate_depth_weighted_mid(
                 snapshot=snapshot,
-                depth=depth
+                depth=depth,
+            )
+
+        elif pricing_method == "exp_depth_weighted":
+            raw_price = self.calculate_exp_weighted_depth_mid(
+                snapshot=snapshot,
+                depth=depth,
+                decay=exp_depth_decay,
+            )
+
+        else:
+            raw_price = self.calculate_depth_weighted_mid(
+                snapshot=snapshot,
+                depth=depth,
+            )
+
+        if raw_price <= 0:
+            self.fair_price = raw_price
+            return raw_price
+
+        if use_ema_smoothing:
+            final_price = self.apply_ema_smoothing(
+                new_price=raw_price,
+                ema_alpha=ema_alpha,
             )
         else:
-            self.fair_price = self.calculate_mid_price(snapshot)
+            final_price = raw_price
 
-        return self.fair_price
+        self.fair_price = final_price
+        return final_price
     #盘口价格四舍五入，Price_tick好像要从外界获取
     def round_to_tick(self, price: float, price_tick: float) -> float:
         if price_tick <= 0:
@@ -1147,6 +1310,10 @@ class OrderMarketMakerStrategy(CtaTemplate):
     pricing_method: str = "depth_weighted"
     pricing_depth: int = 5
 
+    exp_depth_decay: float = 0.6
+    use_ema_smoothing: bool = True
+    ema_alpha: float = 0.2
+
     quote_mode: str = "tick"
     quote_levels: int = 1
     order_volume: float = 1
@@ -1208,6 +1375,10 @@ class OrderMarketMakerStrategy(CtaTemplate):
     parameters = [
         "pricing_method",
         "pricing_depth",
+
+        "exp_depth_decay",
+        "use_ema_smoothing",
+        "ema_alpha",
 
         "quote_mode",
         "quote_levels",
@@ -1303,17 +1474,35 @@ class OrderMarketMakerStrategy(CtaTemplate):
     def on_start(self) -> None:
         self.write_log("Order做市策略启动")
 
+        # 获取合约最小变动价位
         self.price_tick = self.get_pricetick()
+
+        # 获取合约乘数
         self.contract_size = self.get_size()
 
+        # 重置定价引擎状态
+        # 主要是清空 EMA 的历史 fair_price，避免上一次运行残留影响本次回测/实盘
+        self.pricing_engine.reset()
+
+        # 清空当前报价缓存
         self.quote_engine.clear_current_quotes()
 
+        # 清空订单记录
         self.orders.clear()
+
+        # 清空普通做市订单 ID
         self.mm_orderids.clear()
+
+        # 清空强制对冲订单 ID
         self.hedge_orderids.clear()
 
+        # 清空最近一次强制对冲记录
+        self.hedge_engine.clear_last_hedge()
+
+        # 启动时默认不处于强制对冲状态
         self.hedging = False
 
+        # 推送变量更新到界面
         self.put_event()
 
     def on_stop(self) -> None:
@@ -1419,6 +1608,9 @@ class OrderMarketMakerStrategy(CtaTemplate):
             snapshot=snapshot,
             pricing_method=self.pricing_method,
             depth=self.pricing_depth,
+            exp_depth_decay=self.exp_depth_decay,
+            use_ema_smoothing=self.use_ema_smoothing,
+            ema_alpha=self.ema_alpha,
         )
 
         if self.fair_price <= 0:
