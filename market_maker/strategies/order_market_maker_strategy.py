@@ -6,6 +6,7 @@ from vnpy_ctastrategy import (
     StopOrder,
 )
 import math
+
 #目前的问题是 order的发放和强制平仓有点冲突 等待解决
 class MarketDataManager:
     def __init__(self) -> None:
@@ -287,6 +288,7 @@ class PricingEngine:
 
         return round(price / price_tick) * price_tick
 
+#做市quote
 class QuoteEngine:
     def __init__(self) -> None:
         self.current_buy_quotes: list[dict] = []
@@ -555,6 +557,7 @@ class QuoteEngine:
     def clear_current_quotes(self) -> None:
         self.current_buy_quotes:list[dict]= []
         self.current_sell_quotes:list[dict] = []
+
 #判断当前行情是否适合做市，以及根据持仓限制过滤报价
 class QuoteRiskFilter:
     """报价风控过滤器：判断当前行情是否适合做市，以及根据持仓限制过滤报价"""
@@ -743,46 +746,59 @@ class QuoteRiskFilter:
 
 #库存控制，软对冲策略
 class InventorySkewEngine:
-    def __init__(self) -> None:
-        self.last_skew_tick: int = 0
-        self.last_pos_ratio: float = 0.0
+    def __init__(self) -> None:  # 初始化库存偏移引擎对象
+        self.last_skew_tick: int = 0  # 记录上一次报价偏移了多少个 tick
+        self.last_pos_ratio: float = 0.0  # 记录上一次当前持仓占最大持仓的比例
 
-    def apply_skew(
-        self,
-        buy_quotes: list[dict],
-        sell_quotes: list[dict],
-        pos: float,
-        max_position: float,
-        price_tick: float,
-        max_skew_tick: int = 3,
-        snapshot: dict | None = None,
-        passive: bool = True,
-    ) -> tuple[list[dict], list[dict]]:
+    def apply_skew(  # 对买卖报价应用库存偏移
+            self,  # 类实例本身，用来访问成员变量和方法
+            buy_quotes: list[dict],  # 原始买单报价列表，每个元素通常是一个报价字典
+            sell_quotes: list[dict],  # 原始卖单报价列表，每个元素通常是一个报价字典
+            pos: float,  # 当前净持仓，正数表示多头，负数表示空头
+            max_position: float,  # 最大允许持仓，用来衡量当前库存压力
+            price_tick: float,  # 合约最小变动价位，用来计算价格偏移幅度
+            max_skew_tick: int = 3,  # 最大允许偏移 tick 数，默认最多偏移 3 个 tick
+            snapshot: dict | None = None,  # 当前行情快照，可用于获取 bid1、ask1 等盘口价格
+            passive: bool = True,  # 是否保持被动挂单，True 表示尽量不主动吃单
+    ) -> tuple[list[dict], list[dict]]:  # 返回调整后的买单列表和卖单列表
         if not buy_quotes and not sell_quotes:
+            # 如果买卖报价列表都为空，无需进行偏移处理，直接返回
             return buy_quotes, sell_quotes
 
         if max_position <= 0:
+            # 如果最大持仓限制无效（小于等于0），无法计算持仓比例，直接返回原始报价
             return buy_quotes, sell_quotes
 
         if price_tick <= 0:
+            # 如果最小价格变动单位无效（小于等于0），无法计算价格偏移，直接返回原始报价
             return buy_quotes, sell_quotes
 
         if max_skew_tick <= 0:
+            # 如果最大偏移tick数无效（小于等于0），重置偏移状态并返回原始报价
             self.last_skew_tick = 0
             self.last_pos_ratio = 0.0
             return buy_quotes, sell_quotes
 
+
+        # 计算当前持仓占最大持仓的比例，范围在[-1, 1]之间
         pos_ratio = self.calculate_pos_ratio(pos, max_position)
+
+        # 根据持仓比例计算需要偏移的tick数量
         skew_tick = self.calculate_skew_tick(pos_ratio, max_skew_tick)
 
+        # 保存当前的持仓比例和偏移tick数，用于后续跟踪和调试
         self.last_pos_ratio = pos_ratio
         self.last_skew_tick = skew_tick
 
+        # 深拷贝买卖报价列表，避免修改原始数据，为后续价格调整做准备
         adjusted_buy_quotes = [quote.copy() for quote in buy_quotes]
         adjusted_sell_quotes = [quote.copy() for quote in sell_quotes]
 
+
+        # 如果需要偏移的tick数大于0，根据持仓方向调整报价
         if skew_tick > 0:
             if pos > 0:
+                # 多头持仓：买卖报价都向下偏移，促进卖出、抑制买入，降低多头仓位
                 adjusted_buy_quotes = self.move_quotes(
                     quotes=adjusted_buy_quotes,
                     price_tick=price_tick,
@@ -795,6 +811,7 @@ class InventorySkewEngine:
                 )
 
             elif pos < 0:
+                # 空头持仓：买卖报价都向上偏移，促进买入、抑制卖出，降低空头仓位
                 adjusted_buy_quotes = self.move_quotes(
                     quotes=adjusted_buy_quotes,
                     price_tick=price_tick,
@@ -806,6 +823,7 @@ class InventorySkewEngine:
                     skew_tick=skew_tick,
                 )
 
+        # 如果启用被动模式且有行情快照，应用被动挂单限制，避免主动吃单
         if passive and snapshot:
             adjusted_buy_quotes, adjusted_sell_quotes = self.apply_passive_limit(
                 buy_quotes=adjusted_buy_quotes,
@@ -813,24 +831,32 @@ class InventorySkewEngine:
                 snapshot=snapshot,
             )
 
+        # 返回经过库存偏移和被动限制处理后的最终报价
         return adjusted_buy_quotes, adjusted_sell_quotes
 
+    #计算持仓比例，将实际持仓标准化到[-1, 1]区间
     def calculate_pos_ratio(
         self,
         pos: float,
         max_position: float,
     ) -> float:
+
+        # 如果最大持仓限制无效，返回0表示无偏移
         if max_position <= 0:
             return 0.0
 
+        # 计算持仓比例：正数表示多头，负数表示空头
         pos_ratio = pos / max_position
 
+        # 限制比例上限为1.0（防止超出最大持仓时过度偏移）
         if pos_ratio > 1:
             return 1.0
 
+        # 限制比例下限为-1.0（防止超出最大持仓时过度偏移）
         if pos_ratio < -1:
             return -1.0
 
+        # 返回标准化后的持仓比例
         return pos_ratio
 
     def calculate_skew_tick(
@@ -838,9 +864,12 @@ class InventorySkewEngine:
         pos_ratio: float,
         max_skew_tick: int,
     ) -> int:
+        """根据持仓比例计算需要偏移的tick数量"""
+        # 如果最大偏移tick数无效，返回0表示不偏移
         if max_skew_tick <= 0:
             return 0
 
+        # 偏移量与持仓比例的绝对值成正比，持仓越大偏移越多
         return round(abs(pos_ratio) * max_skew_tick)
 
     def move_quotes(
@@ -849,58 +878,143 @@ class InventorySkewEngine:
         price_tick: float,
         skew_tick: int,
     ) -> list[dict]:
+        """对报价列表应用价格偏移"""
         adjusted_quotes: list[dict] = []
 
         for quote in quotes:
+            # 复制报价字典，避免修改原始数据
             adjusted_quote = quote.copy()
+
+            # 计算偏移后的价格：原价格 + (偏移tick数 × 最小变动价位)
             adjusted_price = adjusted_quote["price"] + skew_tick * price_tick
 
+            # 过滤掉价格为负或零的无效报价
             if adjusted_price <= 0:
                 continue
 
+            # 更新报价价格和记录偏移tick数
             adjusted_quote["price"] = adjusted_price
             adjusted_quote["skew_tick"] = skew_tick
 
             adjusted_quotes.append(adjusted_quote)
 
+        # 返回调整后的报价列表（可能因价格无效而减少）
         return adjusted_quotes
 
+   
+   
     def apply_passive_limit(
         self,
         buy_quotes: list[dict],
         sell_quotes: list[dict],
         snapshot: dict,
     ) -> tuple[list[dict], list[dict]]:
+        """应用被动挂单限制，确保报价不会主动吃单"""
+        # 获取市场最优买卖价
         bid1 = snapshot["bid1"]
         ask1 = snapshot["ask1"]
 
         adjusted_buy_quotes: list[dict] = []
         adjusted_sell_quotes: list[dict] = []
 
+        # 处理买单：确保买单价格不超过市场买一价，保持被动排队
         for quote in buy_quotes:
             adjusted_quote = quote.copy()
 
             if bid1 > 0:
+                # 取较小值：如果计算的买价高于bid1，则降为bid1，避免主动吃卖单
                 adjusted_quote["price"] = min(adjusted_quote["price"], bid1)
 
             adjusted_buy_quotes.append(adjusted_quote)
 
+        # 处理卖单：确保卖单价格不低于市场卖一价，保持被动排队
         for quote in sell_quotes:
             adjusted_quote = quote.copy()
 
             if ask1 > 0:
+                # 取较大值：如果计算的卖价低于ask1，则升为ask1，避免主动吃买单
                 adjusted_quote["price"] = max(adjusted_quote["price"], ask1)
 
             adjusted_sell_quotes.append(adjusted_quote)
 
+        # 返回经过被动限制的买卖报价
         return adjusted_buy_quotes, adjusted_sell_quotes
+    """
+    #limit2 相当于虽然能保持档位间距，但会额外把报价推远，可能降低成交概率。 又重新算了一遍各档位，感觉有点过于保守了。
+    def apply_passive_limit2(
+        self,
+        buy_quotes: list[dict],
+        sell_quotes: list[dict],
+        snapshot: dict,
+        price_tick: float,
+    ) -> tuple[list[dict], list[dict]]:
+        #应用被动挂单限制，确保报价不会主动吃单，同时保持多档报价间距
 
+        # 获取市场最优买卖价
+        bid1 = snapshot["bid1"]
+        ask1 = snapshot["ask1"]
+
+        adjusted_buy_quotes: list[dict] = []
+        adjusted_sell_quotes: list[dict] = []
+
+        # 如果 price_tick 不合法，就退回到原来的简单 passive 限制
+        if price_tick <= 0:
+            for quote in buy_quotes:
+                adjusted_quote = quote.copy()
+
+                if bid1 > 0:
+                    adjusted_quote["price"] = min(adjusted_quote["price"], bid1)
+
+                adjusted_buy_quotes.append(adjusted_quote)
+
+            for quote in sell_quotes:
+                adjusted_quote = quote.copy()
+
+                if ask1 > 0:
+                    adjusted_quote["price"] = max(adjusted_quote["price"], ask1)
+
+                adjusted_sell_quotes.append(adjusted_quote)
+
+            return adjusted_buy_quotes, adjusted_sell_quotes
+
+        # 处理买单：
+        # 第 1 档买单最多挂在 bid1
+        # 第 2 档买单最多挂在 bid1 - 1 * price_tick
+        # 第 3 档买单最多挂在 bid1 - 2 * price_tick
+        for index, quote in enumerate(buy_quotes):
+            adjusted_quote = quote.copy()
+
+            if bid1 > 0:
+                max_buy_price = bid1 - index * price_tick
+                adjusted_quote["price"] = min(adjusted_quote["price"], max_buy_price)
+
+            adjusted_buy_quotes.append(adjusted_quote)
+
+        # 处理卖单：
+        # 第 1 档卖单最低挂在 ask1
+        # 第 2 档卖单最低挂在 ask1 + 1 * price_tick
+        # 第 3 档卖单最低挂在 ask1 + 2 * price_tick
+        for index, quote in enumerate(sell_quotes):
+            adjusted_quote = quote.copy()
+
+            if ask1 > 0:
+                min_sell_price = ask1 + index * price_tick
+                adjusted_quote["price"] = max(adjusted_quote["price"], min_sell_price)
+
+            adjusted_sell_quotes.append(adjusted_quote)
+
+        # 返回经过 passive 限制，并保持档位间距后的买卖报价
+        return adjusted_buy_quotes, adjusted_sell_quotes
+    """
     def get_last_skew_tick(self) -> int:
+        """获取上一次应用的库存偏移tick数，用于监控和调试"""
         return self.last_skew_tick
 
     def get_last_pos_ratio(self) -> float:
+        """获取上一次的持仓比例，用于监控当前库存风险程度"""
         return self.last_pos_ratio
-#强制平仓对冲
+
+# hedge_engine.py
 class HedgeEngine:
     def __init__(self) -> None:
         self.last_hedge_action: str = ""
@@ -937,7 +1051,7 @@ class HedgeEngine:
                 price_tick=price_tick,
                 hedge_price_tick=hedge_price_tick,
             )
-
+            #abs为绝对值的意思
             volume = min(abs(pos), hedge_volume)
 
             hedge_order = {
@@ -970,7 +1084,7 @@ class HedgeEngine:
             return hedge_order
 
         return None
-
+    #以略低于买一价的价格挂单，提高成交优先级，快速平掉多头仓位
     def calculate_sell_close_price(
         self,
         bid1: float,
@@ -986,7 +1100,7 @@ class HedgeEngine:
             return bid1
 
         return price
-
+    #以略高于卖一价的价格挂单，提高成交优先级，快速平掉空头仓位
     def calculate_buy_close_price(
         self,
         ask1: float,
@@ -999,63 +1113,72 @@ class HedgeEngine:
         return ask1 + hedge_price_tick * price_tick
 
     def update_last_hedge(self, hedge_order: dict) -> None:
+        """更新最近一次强制平仓操作的记录"""
         self.last_hedge_action = hedge_order["action"]
         self.last_hedge_price = hedge_order["price"]
         self.last_hedge_volume = hedge_order["volume"]
 
     def clear_last_hedge(self) -> None:
+        """清空强制平仓记录，重置为初始状态"""
         self.last_hedge_action = ""
         self.last_hedge_price = 0.0
         self.last_hedge_volume = 0.0
 
     def get_last_hedge_action(self) -> str:
+        """获取最近一次强制平仓的操作类型"""
         return self.last_hedge_action
 
     def get_last_hedge_price(self) -> float:
+        """获取最近一次强制平仓的价格"""
         return self.last_hedge_price
 
     def get_last_hedge_volume(self) -> float:
+        """获取最近一次强制平仓的数量"""
         return self.last_hedge_volume
 
-
-
+# 主策略, 继承CtaTemplate
 class OrderMarketMakerStrategy(CtaTemplate):
     """Order模式通用做市策略"""
 
     author = "Morgan"
-
-    pricing_method: str = "mid"
+    # =====================
+    # 策略参数
+    # =====================
+    pricing_method: str = "depth_weighted"
     pricing_depth: int = 5
 
     quote_mode: str = "tick"
-    quote_levels: int = 3
+    quote_levels: int = 1
     order_volume: float = 1
 
-    spread_tick: int = 1
+    spread_tick: int = 2
     level_interval_tick: int = 1
 
     spread_percent: float = 0.0002
     level_interval_percent: float = 0.0001
 
     split_count: int = 1
-    update_tolerance: int = 1
+    update_tolerance: int = 2
 
-    min_depth: int = 1
-    min_spread_tick: int = 1
+    min_depth: int = 5
+    min_spread_tick: int = 2
     depth_check_level: int = 5
-    min_depth_volume: float = 1
-    max_imbalance: float = 0.95
+    min_depth_volume: float = 50
+    max_imbalance: float = 0.1
 
-    max_position: float = 10
-    max_skew_tick: int = 3
+    max_position: float = 4
+    max_skew_tick: int = 2
 
-    enable_hedge: bool = False
-    hedge_threshold: float = 8
+    enable_hedge: bool = True
+    hedge_threshold: float = 4
     hedge_volume: float = 1
-    hedge_price_tick: int = 1
+    hedge_price_tick: int = 0
 
     cancel_on_trade: bool = True
     passive_quote: bool = True
+    # =====================
+    # 策略变量
+    # =====================
 
     price_tick: float = 0.0
     contract_size: int = 0
@@ -1068,6 +1191,9 @@ class OrderMarketMakerStrategy(CtaTemplate):
     fair_price: float = 0.0
 
     active_order_count: int = 0
+    mm_order_count: int = 0
+    hedge_order_count: int = 0
+
     trade_count: int = 0
 
     last_skew_tick: int = 0
@@ -1077,6 +1203,8 @@ class OrderMarketMakerStrategy(CtaTemplate):
     last_hedge_price: float = 0.0
     last_hedge_volume: float = 0.0
 
+    hedging: bool = False
+    #这两个 list 是给 vn.py 的策略框架识别用的。
     parameters = [
         "pricing_method",
         "pricing_depth",
@@ -1111,7 +1239,7 @@ class OrderMarketMakerStrategy(CtaTemplate):
         "cancel_on_trade",
         "passive_quote",
     ]
-
+    # 这两个 list 是给 vn.py 的策略框架识别用的。
     variables = [
         "price_tick",
         "contract_size",
@@ -1124,6 +1252,8 @@ class OrderMarketMakerStrategy(CtaTemplate):
         "fair_price",
 
         "active_order_count",
+        "mm_order_count",
+        "hedge_order_count",
         "trade_count",
 
         "last_skew_tick",
@@ -1132,6 +1262,8 @@ class OrderMarketMakerStrategy(CtaTemplate):
         "last_hedge_action",
         "last_hedge_price",
         "last_hedge_volume",
+
+        "hedging",
     ]
 
     def __init__(
@@ -1143,6 +1275,7 @@ class OrderMarketMakerStrategy(CtaTemplate):
     ) -> None:
         super().__init__(cta_engine, strategy_name, vt_symbol, setting)
 
+        # 各个功能模块
         self.market_data = MarketDataManager()
         self.pricing_engine = PricingEngine()
         self.quote_engine = QuoteEngine()
@@ -1150,8 +1283,18 @@ class OrderMarketMakerStrategy(CtaTemplate):
         self.hedge_engine = HedgeEngine()
         self.quote_risk_filter = QuoteRiskFilter()
 
+        # 全部订单记录
         self.orders: dict[str, OrderData] = {}
-        self.active_orderids: set[str] = set()
+
+        # 普通做市订单 ID
+        self.mm_orderids: set[str] = set()
+
+        # 强制对冲订单 ID
+        self.hedge_orderids: set[str] = set()
+
+    # =====================
+    # 生命周期函数
+    # =====================
 
     def on_init(self) -> None:
         self.write_log("Order做市策略初始化")
@@ -1164,8 +1307,12 @@ class OrderMarketMakerStrategy(CtaTemplate):
         self.contract_size = self.get_size()
 
         self.quote_engine.clear_current_quotes()
-        self.active_orderids.clear()
+
         self.orders.clear()
+        self.mm_orderids.clear()
+        self.hedge_orderids.clear()
+
+        self.hedging = False
 
         self.put_event()
 
@@ -1173,12 +1320,35 @@ class OrderMarketMakerStrategy(CtaTemplate):
         self.write_log("Order做市策略停止")
 
         self.cancel_all()
+
         self.quote_engine.clear_current_quotes()
-        self.active_orderids.clear()
+
+        self.orders.clear()
+        self.mm_orderids.clear()
+        self.hedge_orderids.clear()
+
+        self.hedging = False
 
         self.put_event()
 
+    # =====================
+    # on_tick：行情来了，负责普通做市报价
+    # =====================
+
     def on_tick(self, tick: TickData) -> None:
+        """
+        行情事件。
+
+        主要负责：
+        1. 更新行情快照；
+        2. 检查行情是否适合做市；
+        3. 计算基准价；
+        4. 生成原始报价；
+        5. 库存偏移；
+        6. 仓位过滤；
+        7. 撤旧普通单，发新普通单。
+        """
+
         snapshot = self.market_data.update_tick(tick)
 
         self.bid1 = snapshot["bid1"]
@@ -1189,51 +1359,62 @@ class OrderMarketMakerStrategy(CtaTemplate):
         if self.price_tick <= 0:
             self.price_tick = self.get_pricetick()
 
+        # 如果正在强制对冲，就不再发普通做市单
+        if self.hedging:
+            self.put_event()
+            return
+
+        # 行情基础检查
         if not self.quote_risk_filter.check_market_data(snapshot):
-            self.cancel_all()
+            self.cancel_market_making_orders()
             self.quote_engine.clear_current_quotes()
             self.put_event()
             return
 
+        # 深度检查
         if not self.quote_risk_filter.check_depth(
             snapshot=snapshot,
             min_depth=self.min_depth,
         ):
-            self.cancel_all()
+            self.cancel_market_making_orders()
             self.quote_engine.clear_current_quotes()
             self.put_event()
             return
 
+        # 价差检查
         if not self.quote_risk_filter.check_spread(
             snapshot=snapshot,
             price_tick=self.price_tick,
             min_spread_tick=self.min_spread_tick,
         ):
-            self.cancel_all()
+            self.cancel_market_making_orders()
             self.quote_engine.clear_current_quotes()
             self.put_event()
             return
 
+        # 深度挂单量检查
         if not self.quote_risk_filter.check_depth_volume(
             snapshot=snapshot,
             depth=self.depth_check_level,
             min_depth_volume=self.min_depth_volume,
         ):
-            self.cancel_all()
+            self.cancel_market_making_orders()
             self.quote_engine.clear_current_quotes()
             self.put_event()
             return
 
+        # 盘口不平衡检查
         if not self.quote_risk_filter.check_imbalance(
             snapshot=snapshot,
             max_imbalance=self.max_imbalance,
             depth=self.depth_check_level,
         ):
-            self.cancel_all()
+            self.cancel_market_making_orders()
             self.quote_engine.clear_current_quotes()
             self.put_event()
             return
 
+        # 计算基准价
         self.fair_price = self.pricing_engine.calculate_fair_price(
             snapshot=snapshot,
             pricing_method=self.pricing_method,
@@ -1241,11 +1422,12 @@ class OrderMarketMakerStrategy(CtaTemplate):
         )
 
         if self.fair_price <= 0:
-            self.cancel_all()
+            self.cancel_market_making_orders()
             self.quote_engine.clear_current_quotes()
             self.put_event()
             return
 
+        # 生成原始报价
         buy_quotes, sell_quotes = self.quote_engine.generate_quotes(
             fair_price=self.fair_price,
             price_tick=self.price_tick,
@@ -1261,6 +1443,7 @@ class OrderMarketMakerStrategy(CtaTemplate):
             passive=self.passive_quote,
         )
 
+        # 根据库存进行软偏移
         buy_quotes, sell_quotes = self.inventory_skew_engine.apply_skew(
             buy_quotes=buy_quotes,
             sell_quotes=sell_quotes,
@@ -1275,6 +1458,7 @@ class OrderMarketMakerStrategy(CtaTemplate):
         self.last_skew_tick = self.inventory_skew_engine.get_last_skew_tick()
         self.last_pos_ratio = self.inventory_skew_engine.get_last_pos_ratio()
 
+        # 根据最大仓位做硬过滤
         buy_quotes, sell_quotes = self.quote_risk_filter.filter_by_position(
             buy_quotes=buy_quotes,
             sell_quotes=sell_quotes,
@@ -1283,11 +1467,12 @@ class OrderMarketMakerStrategy(CtaTemplate):
         )
 
         if not buy_quotes and not sell_quotes:
-            self.cancel_all()
+            self.cancel_market_making_orders()
             self.quote_engine.clear_current_quotes()
             self.put_event()
             return
 
+        # 判断是否需要撤单重挂
         if not self.quote_engine.need_requote(
             new_buy_quotes=buy_quotes,
             new_sell_quotes=sell_quotes,
@@ -1297,86 +1482,203 @@ class OrderMarketMakerStrategy(CtaTemplate):
             self.put_event()
             return
 
-        self.cancel_all()
-        self.active_orderids.clear()
+        # 只撤普通做市单，不动 hedge 单
+        self.cancel_market_making_orders()
 
+        # 发新的普通买单
         for quote in buy_quotes:
             vt_orderids = self.buy(
                 price=quote["price"],
                 volume=quote["volume"],
             )
-            self.active_orderids.update(vt_orderids)
+            self.mm_orderids.update(vt_orderids)
 
+        # 发新的普通卖空单
         for quote in sell_quotes:
             vt_orderids = self.short(
                 price=quote["price"],
                 volume=quote["volume"],
             )
-            self.active_orderids.update(vt_orderids)
+            self.mm_orderids.update(vt_orderids)
 
+        # 更新当前报价缓存
         self.quote_engine.update_current_quotes(
             buy_quotes=buy_quotes,
             sell_quotes=sell_quotes,
         )
 
-        self.active_order_count = len(self.active_orderids)
-
+        self.update_order_count()
         self.put_event()
 
-    def on_order(self, order: OrderData) -> None:
-        self.orders[order.vt_orderid] = order
-
-        if order.is_active():
-            self.active_orderids.add(order.vt_orderid)
-        else:
-            self.active_orderids.discard(order.vt_orderid)
-
-        self.active_order_count = len(self.active_orderids)
-
-        self.put_event()
+    # =====================
+    # on_trade：成交了，负责强制对冲检查
+    # =====================
 
     def on_trade(self, trade: TradeData) -> None:
+        """
+        成交事件。
+
+        主要负责：
+        1. 记录成交次数；
+        2. 成交后撤掉普通做市单；
+        3. 检查是否触发强制对冲；
+        4. 如果触发，就发强制平仓单。
+        """
+
         self.trade_count += 1
 
+        # 普通做市成交后，最好撤掉旧报价，等待下一个 tick 重新报价
         if self.cancel_on_trade:
-            self.cancel_all()
+            self.cancel_market_making_orders()
             self.quote_engine.clear_current_quotes()
-            self.active_orderids.clear()
 
+        # 检查是否需要强制对冲
         if self.enable_hedge:
-            snapshot = self.market_data.get_snapshot()
+            self.check_and_send_hedge_order()
 
-            hedge_order = self.hedge_engine.check_hedge(
-                pos=self.pos,
-                hedge_threshold=self.hedge_threshold,
-                hedge_volume=self.hedge_volume,
-                price_tick=self.price_tick,
-                snapshot=snapshot,
-                hedge_price_tick=self.hedge_price_tick,
-            )
+        self.update_order_count()
+        self.put_event()
 
-            if hedge_order:
-                if hedge_order["action"] == "SELL_CLOSE":
-                    vt_orderids = self.sell(
-                        price=hedge_order["price"],
-                        volume=hedge_order["volume"],
-                    )
-                    self.active_orderids.update(vt_orderids)
+    # =====================
+    # on_order：订单状态变了，负责维护订单集合
+    # =====================
 
-                elif hedge_order["action"] == "BUY_CLOSE":
-                    vt_orderids = self.cover(
-                        price=hedge_order["price"],
-                        volume=hedge_order["volume"],
-                    )
-                    self.active_orderids.update(vt_orderids)
+    def on_order(self, order: OrderData) -> None:
+        """
+        订单事件。
 
-                self.last_hedge_action = self.hedge_engine.get_last_hedge_action()
-                self.last_hedge_price = self.hedge_engine.get_last_hedge_price()
-                self.last_hedge_volume = self.hedge_engine.get_last_hedge_volume()
+        主要负责：
+        1. 更新订单状态；
+        2. 区分普通做市单和强制对冲单；
+        3. 清理已经完成的订单；
+        4. 如果强制对冲单结束，判断是否恢复普通做市。
+        """
 
-        self.active_order_count = len(self.active_orderids)
+        self.orders[order.vt_orderid] = order
 
+        if not order.is_active():
+            self.mm_orderids.discard(order.vt_orderid)
+            self.hedge_orderids.discard(order.vt_orderid)
+
+        # 如果没有正在挂的 hedge 单，说明强制对冲状态可以结束
+        if self.hedging and not self.hedge_orderids:
+            # 如果仓位已经回到强制对冲阈值以内，就恢复普通报价
+            if abs(self.pos) < self.hedge_threshold:
+                self.hedging = False
+                self.hedge_engine.clear_last_hedge()
+
+        self.update_order_count()
+        self.put_event()
+
+    # =====================
+    # on_timer：定时检查，可选
+    # =====================
+
+    def on_timer(self) -> None:
+        """
+        定时事件。
+
+        这里先保留简单版本。
+        后面可以加：
+        1. 普通订单超时撤单；
+        2. 对冲订单超时重挂；
+        3. 日志输出；
+        4. 风控兜底。
+        """
+
+        self.update_order_count()
         self.put_event()
 
     def on_stop_order(self, stop_order: StopOrder) -> None:
         self.put_event()
+
+    # =====================
+    # 辅助函数：撤普通做市单
+    # =====================
+
+    def cancel_market_making_orders(self) -> None:
+        """
+        只撤普通做市单，不撤强制对冲单。
+        """
+
+        for vt_orderid in list(self.mm_orderids):
+            self.cancel_order(vt_orderid)
+
+        self.mm_orderids.clear()
+        self.quote_engine.clear_current_quotes()
+
+    # =====================
+    # 辅助函数：撤强制对冲单
+    # =====================
+
+    def cancel_hedge_orders(self) -> None:
+        """
+        只撤强制对冲单。
+        """
+
+        for vt_orderid in list(self.hedge_orderids):
+            self.cancel_order(vt_orderid)
+
+        self.hedge_orderids.clear()
+
+    # =====================
+    # 辅助函数：检查并发送强制对冲单
+    # =====================
+
+    def check_and_send_hedge_order(self) -> None:
+        """
+        检查当前持仓是否超过强制对冲阈值。
+        如果超过，就暂停普通做市，撤普通单，发强制平仓单。
+        """
+
+        snapshot = self.market_data.get_snapshot()
+
+        hedge_order = self.hedge_engine.check_hedge(
+            pos=self.pos,
+            hedge_threshold=self.hedge_threshold,
+            hedge_volume=self.hedge_volume,
+            price_tick=self.price_tick,
+            snapshot=snapshot,
+            hedge_price_tick=self.hedge_price_tick,
+        )
+
+        if not hedge_order:
+            return
+
+        # 已经有强制对冲单在挂着，就不要重复发
+        if self.hedge_orderids:
+            return
+
+        # 进入强制对冲状态
+        self.hedging = True
+
+        # 先撤普通做市单，避免一边对冲一边继续加仓
+        self.cancel_market_making_orders()
+
+        # 根据 hedge_order 发平仓单
+        if hedge_order["action"] == "SELL_CLOSE":
+            vt_orderids = self.sell(
+                price=hedge_order["price"],
+                volume=hedge_order["volume"],
+            )
+            self.hedge_orderids.update(vt_orderids)
+
+        elif hedge_order["action"] == "BUY_CLOSE":
+            vt_orderids = self.cover(
+                price=hedge_order["price"],
+                volume=hedge_order["volume"],
+            )
+            self.hedge_orderids.update(vt_orderids)
+
+        self.last_hedge_action = self.hedge_engine.get_last_hedge_action()
+        self.last_hedge_price = self.hedge_engine.get_last_hedge_price()
+        self.last_hedge_volume = self.hedge_engine.get_last_hedge_volume()
+
+    # =====================
+    # 辅助函数：更新订单数量
+    # =====================
+
+    def update_order_count(self) -> None:
+        self.mm_order_count = len(self.mm_orderids)
+        self.hedge_order_count = len(self.hedge_orderids)
+        self.active_order_count = self.mm_order_count + self.hedge_order_count
