@@ -7,7 +7,8 @@ from vnpy_ctastrategy import (
 )
 import math
 
-#目前的问题是 order的发放和强制平仓有点冲突 等待解决
+
+# 目前的问题是 order的发放和强制平仓有点冲突 等待解决
 class MarketDataManager:
     def __init__(self) -> None:
         self.last_tick: TickData | None = None
@@ -86,15 +87,15 @@ class MarketDataManager:
         return self.get_snapshot()
 
     def _calculate_valid_depth(self) -> int:
-        #有效深度默认为0
+        # 有效深度默认为0
         valid_depth = 0
-        #循环遍历盘口数据，计算有效深度，量价都不为0才行
+        # 循环遍历盘口数据，计算有效深度，量价都不为0才行
         for i in range(5):
             if (
-                self.bid_prices[i] > 0
-                and self.ask_prices[i] > 0
-                and self.bid_volumes[i] > 0
-                and self.ask_volumes[i] > 0
+                    self.bid_prices[i] > 0
+                    and self.ask_prices[i] > 0
+                    and self.bid_volumes[i] > 0
+                    and self.ask_volumes[i] > 0
             ):
                 valid_depth += 1
             else:
@@ -102,7 +103,7 @@ class MarketDataManager:
 
         return valid_depth
 
-    #返回快照snapshot，snapshot包含当前时刻盘口的各种数据，方便后续直接调用snapshot，snapshot为字典
+    # 返回快照snapshot，snapshot包含当前时刻盘口的各种数据，方便后续直接调用snapshot，snapshot为字典
     def get_snapshot(self) -> dict:
         return {
             "datetime": self.datetime,
@@ -118,7 +119,8 @@ class MarketDataManager:
             "market_spread": self.market_spread,
             "valid_depth": self.valid_depth,
         }
-    #检查盘口数据是否合法
+
+    # 检查盘口数据是否合法
     def is_valid(self) -> bool:
         if self.bid1 <= 0:
             return False
@@ -136,10 +138,12 @@ class MarketDataManager:
             return False
 
         return True
-    #判断当前盘口数据是否为5档
+
+    # 判断当前盘口数据是否为5档
     def has_depth(self, depth: int = 5) -> bool:
         return self.valid_depth >= depth
-    #判断当前五档volume的总值是多少，分别为bid_total_volume, ask_total_volume
+
+    # 判断当前五档volume的总值是多少，分别为bid_total_volume, ask_total_volume
     def get_depth_volume(self, depth: int = 5) -> tuple[float, float]:
         depth = min(depth, 5, self.valid_depth)
 
@@ -150,7 +154,8 @@ class MarketDataManager:
         ask_volume_sum = sum(self.ask_volumes[:depth])
 
         return bid_volume_sum, ask_volume_sum
-    #判断当前盘口是不是一边倒，如果太极端，就不要贸然做市。
+
+    # 判断当前盘口是不是一边倒，如果太极端，就不要贸然做市。
     def get_order_book_imbalance(self, depth: int = 5) -> float:
         bid_volume_sum, ask_volume_sum = self.get_depth_volume(depth)
         total_volume = bid_volume_sum + ask_volume_sum
@@ -159,13 +164,15 @@ class MarketDataManager:
             return 0.0
 
         return (bid_volume_sum - ask_volume_sum) / total_volume
-    #获取ask1和bid1的中价
+
+    # 获取ask1和bid1的中价
     def get_mid_price(self) -> float:
         if not self.is_valid():
             return 0.0
 
         return (self.bid1 + self.ask1) / 2
-    #根据买一卖一价格 + 买一卖一挂单量，估算出来的更合理的短期基准价。
+
+    # 根据买一卖一价格 + 买一卖一挂单量，估算出来的更合理的短期基准价。
     def get_micro_price(self) -> float:
         if not self.is_valid():
             return 0.0
@@ -176,11 +183,12 @@ class MarketDataManager:
             return self.get_mid_price()
 
         return (
-            self.ask1 * self.bid1_volume
-            + self.bid1 * self.ask1_volume
+                self.ask1 * self.bid1_volume
+                + self.bid1 * self.ask1_volume
         ) / total_volume
 
-#定价可能包含单基准价 或者多基准价，都有可能 目前因该是为了方便 所以用的应该是单基准价
+
+# 定价可能包含单基准价 或者多基准价，都有可能 目前因该是为了方便 所以用的应该是单基准价
 class PricingEngine:
     def __init__(self) -> None:
         self.mid_price: float = 0.0
@@ -202,7 +210,7 @@ class PricingEngine:
         self.ema_fair_price = 0.0
         self.fair_price = 0.0
 
-    #计算中价，
+    # 计算中价，
     def calculate_mid_price(self, snapshot: dict) -> float:
         bid1 = snapshot["bid1"]
         ask1 = snapshot["ask1"]
@@ -212,7 +220,8 @@ class PricingEngine:
 
         self.mid_price = (bid1 + ask1) / 2
         return self.mid_price
-    #计算微基准价，就是那个公式。
+
+    # 计算微基准价，就是那个公式。
     def calculate_micro_price(self, snapshot: dict) -> float:
         bid1 = snapshot["bid1"]
         ask1 = snapshot["ask1"]
@@ -228,13 +237,14 @@ class PricingEngine:
             return self.calculate_mid_price(snapshot)
 
         self.micro_price = (
-            ask1 * bid1_volume
-            + bid1 * ask1_volume
-        ) / total_volume
+                                   ask1 * bid1_volume
+                                   + bid1 * ask1_volume
+                           ) / total_volume
 
         return self.micro_price
-    #计算五档盘口加权中间价。量价相乘然后加权平均/2
-    def calculate_depth_weighted_mid(self,snapshot: dict,depth: int = 5) -> float:
+
+    # 计算五档盘口加权中间价。量价相乘然后加权平均/2
+    def calculate_depth_weighted_mid(self, snapshot: dict, depth: int = 5) -> float:
         bid_prices = snapshot["bid_prices"]
         ask_prices = snapshot["ask_prices"]
         bid_volumes = snapshot["bid_volumes"]
@@ -353,9 +363,9 @@ class PricingEngine:
     # ==================== 新增：EMA 平滑 ====================
 
     def apply_ema_smoothing(
-        self,
-        new_price: float,
-        ema_alpha: float = 0.2,
+            self,
+            new_price: float,
+            ema_alpha: float = 0.2,
     ) -> float:
         """
         对 fair_price 做 EMA 平滑。
@@ -377,8 +387,8 @@ class PricingEngine:
             self.ema_fair_price = new_price
         else:
             self.ema_fair_price = (
-                ema_alpha * new_price
-                + (1 - ema_alpha) * self.ema_fair_price
+                    ema_alpha * new_price
+                    + (1 - ema_alpha) * self.ema_fair_price
             )
 
         return self.ema_fair_price
@@ -444,14 +454,16 @@ class PricingEngine:
 
         self.fair_price = final_price
         return final_price
-    #盘口价格四舍五入，Price_tick好像要从外界获取
+
+    # 盘口价格四舍五入，Price_tick好像要从外界获取
     def round_to_tick(self, price: float, price_tick: float) -> float:
         if price_tick <= 0:
             return price
 
         return round(price / price_tick) * price_tick
 
-#做市quote
+
+# 做市quote
 class QuoteEngine:
     def __init__(self) -> None:
         self.current_buy_quotes: list[dict] = []
@@ -528,7 +540,7 @@ class QuoteEngine:
 ]
         """
 
-        #每一档单独计算，每一次循环就是一档报价
+        # 每一档单独计算，每一次循环就是一档报价
         for level in range(1, quote_levels + 1):
             if quote_mode == "tick":
                 buy_price, sell_price, offset_value = self._calculate_tick_quote_price(
@@ -596,8 +608,10 @@ class QuoteEngine:
                 )
 
         return buy_quotes, sell_quotes
-    #在generate_quotes()方法中，_calculate_tick_quote_price()方法用于计算每一档的报价价格。
-    def _calculate_tick_quote_price(self,fair_price: float,price_tick: float,level: int,spread_tick: int,level_interval_tick: int,) -> tuple[float, float, float]:
+
+    # 在generate_quotes()方法中，_calculate_tick_quote_price()方法用于计算每一档的报价价格。
+    def _calculate_tick_quote_price(self, fair_price: float, price_tick: float, level: int, spread_tick: int,
+                                    level_interval_tick: int, ) -> tuple[float, float, float]:
         if spread_tick < 0:
             spread_tick = 0
 
@@ -613,8 +627,10 @@ class QuoteEngine:
         sell_price = self.ceil_to_tick(raw_sell_price, price_tick)
 
         return buy_price, sell_price, float(offset_tick)
-    #在generate_quotes()方法中，_calculate_percent_quote_price()方法用于计算每一档的报价价格。
-    def _calculate_percent_quote_price(self, fair_price: float,price_tick: float,level: int,spread_percent: float,level_interval_percent: float,) -> tuple[float, float, float]:
+
+    # 在generate_quotes()方法中，_calculate_percent_quote_price()方法用于计算每一档的报价价格。
+    def _calculate_percent_quote_price(self, fair_price: float, price_tick: float, level: int, spread_percent: float,
+                                       level_interval_percent: float, ) -> tuple[float, float, float]:
         if spread_percent < 0:
             spread_percent = 0.0
 
@@ -630,32 +646,36 @@ class QuoteEngine:
         sell_price = self.ceil_to_tick(raw_sell_price, price_tick)
 
         return buy_price, sell_price, offset_percent
-    #floor_to_tick：往下取合法价格，买单常用
+
+    # floor_to_tick：往下取合法价格，买单常用
     def floor_to_tick(self, price: float, price_tick: float) -> float:
         if price_tick <= 0:
             return price
 
         return math.floor(price / price_tick) * price_tick
-    #ceil_to_tick：往上取合法价格，卖单常用
+
+    # ceil_to_tick：往上取合法价格，卖单常用
     def ceil_to_tick(self, price: float, price_tick: float) -> float:
         if price_tick <= 0:
             return price
 
         return math.ceil(price / price_tick) * price_tick
-    #round_to_tick：就近取合法价格，基准价常用
+
+    # round_to_tick：就近取合法价格，基准价常用
     def round_to_tick(self, price: float, price_tick: float) -> float:
         if price_tick <= 0:
             return price
 
         return round(price / price_tick) * price_tick
-    #用来对比当前报价和InventorySkewEngine处理过后的新报价的偏差是多少，偏差过多的话决定是否要重新报价
+
+    # 用来对比当前报价和InventorySkewEngine处理过后的新报价的偏差是多少，偏差过多的话决定是否要重新报价
 
     def need_requote(self,
-            new_buy_quotes: list[dict],  # 新生成的买单报价列表，可能已经经过库存偏移调整
-            new_sell_quotes: list[dict],  # 新生成的卖单报价列表，可能已经经过库存偏移调整
-            price_tick: float,  # 合约最小变动价位，用来计算价格容忍范围
-            update_tolerance: int,  # 报价更新容忍度，单位是 tick
-    ) -> bool:  # 返回 True 表示需要撤单重挂，False 表示不需要
+                     new_buy_quotes: list[dict],  # 新生成的买单报价列表，可能已经经过库存偏移调整
+                     new_sell_quotes: list[dict],  # 新生成的卖单报价列表，可能已经经过库存偏移调整
+                     price_tick: float,  # 合约最小变动价位，用来计算价格容忍范围
+                     update_tolerance: int,  # 报价更新容忍度，单位是 tick
+                     ) -> bool:  # 返回 True 表示需要撤单重挂，False 表示不需要
         # 如果最小变动价位不合法，就无法判断价格变化，直接不重挂
         if price_tick <= 0:
             return False
@@ -710,18 +730,19 @@ class QuoteEngine:
         return False
 
     def update_current_quotes(
-        self,
-        buy_quotes: list[dict],
-        sell_quotes: list[dict],
+            self,
+            buy_quotes: list[dict],
+            sell_quotes: list[dict],
     ) -> None:
-        self.current_buy_quotes: list[dict]= [quote.copy() for quote in buy_quotes]
+        self.current_buy_quotes: list[dict] = [quote.copy() for quote in buy_quotes]
         self.current_sell_quotes: list[dict] = [quote.copy() for quote in sell_quotes]
 
     def clear_current_quotes(self) -> None:
-        self.current_buy_quotes:list[dict]= []
-        self.current_sell_quotes:list[dict] = []
+        self.current_buy_quotes: list[dict] = []
+        self.current_sell_quotes: list[dict] = []
 
-#判断当前行情是否适合做市，以及根据持仓限制过滤报价
+
+# 判断当前行情是否适合做市，以及根据持仓限制过滤报价
 class QuoteRiskFilter:
     """报价风控过滤器：判断当前行情是否适合做市，以及根据持仓限制过滤报价"""
 
@@ -730,10 +751,10 @@ class QuoteRiskFilter:
         检查最基础的盘口数据是否合法。
         只检查买一卖一，不检查五档深度。
         """
-        bid1 = snapshot["bid1"]                         # 买一价
-        ask1 = snapshot["ask1"]                         # 卖一价
-        bid1_volume = snapshot["bid1_volume"]           # 买一挂单量
-        ask1_volume = snapshot["ask1_volume"]           # 卖一挂单量
+        bid1 = snapshot["bid1"]  # 买一价
+        ask1 = snapshot["ask1"]  # 卖一价
+        bid1_volume = snapshot["bid1_volume"]  # 买一挂单量
+        ask1_volume = snapshot["ask1_volume"]  # 卖一挂单量
 
         # 买一价必须大于 0
         if bid1 <= 0:
@@ -759,29 +780,29 @@ class QuoteRiskFilter:
         return True
 
     def check_depth(
-        self,
-        snapshot: dict,       # 当前行情快照
-        min_depth: int = 1    # 最小要求盘口深度，默认至少 1 档
+            self,
+            snapshot: dict,  # 当前行情快照
+            min_depth: int = 1  # 最小要求盘口深度，默认至少 1 档
     ) -> bool:
         """
         检查当前盘口有效深度是否足够。
         比如 min_depth=5，就要求买卖五档都有效。
         """
-        valid_depth = snapshot["valid_depth"]            # 当前有效盘口深度
+        valid_depth = snapshot["valid_depth"]  # 当前有效盘口深度
 
         return valid_depth >= min_depth
 
     def check_spread(
-        self,
-        snapshot: dict,          # 当前行情快照
-        price_tick: float,       # 合约最小变动价位
-        min_spread_tick: int     # 最小价差要求，单位是 tick
+            self,
+            snapshot: dict,  # 当前行情快照
+            price_tick: float,  # 合约最小变动价位
+            min_spread_tick: int  # 最小价差要求，单位是 tick
     ) -> bool:
         """
         检查当前买卖价差是否足够。
         如果价差太小，做市利润空间不够，就不报价。
         """
-        market_spread = snapshot["market_spread"]        # 当前盘口价差 = ask1 - bid1
+        market_spread = snapshot["market_spread"]  # 当前盘口价差 = ask1 - bid1
 
         # price_tick 不合法，无法换算价差 tick 数
         if price_tick <= 0:
@@ -795,18 +816,18 @@ class QuoteRiskFilter:
         return spread_tick >= min_spread_tick
 
     def check_depth_volume(
-        self,
-        snapshot: dict,             # 当前行情快照
-        depth: int = 5,             # 检查前几档盘口
-        min_depth_volume: float = 1 # 前 N 档买卖盘最小挂单量要求
+            self,
+            snapshot: dict,  # 当前行情快照
+            depth: int = 5,  # 检查前几档盘口
+            min_depth_volume: float = 1  # 前 N 档买卖盘最小挂单量要求
     ) -> bool:
         """
         检查前 N 档买卖盘挂单量是否足够。
         如果盘口太薄，容易被打穿，不适合做市。
         """
-        bid_volumes = snapshot["bid_volumes"]            # 五档买盘挂单量
-        ask_volumes = snapshot["ask_volumes"]            # 五档卖盘挂单量
-        valid_depth = snapshot["valid_depth"]            # 当前有效深度
+        bid_volumes = snapshot["bid_volumes"]  # 五档买盘挂单量
+        ask_volumes = snapshot["ask_volumes"]  # 五档卖盘挂单量
+        valid_depth = snapshot["valid_depth"]  # 当前有效深度
 
         # 实际检查深度不能超过：
         # 1. 传入的 depth
@@ -835,19 +856,19 @@ class QuoteRiskFilter:
         return True
 
     def check_imbalance(
-        self,
-        snapshot: dict,          # 当前行情快照
-        max_imbalance: float = 0.9, # 最大允许盘口不平衡程度
-        depth: int = 5           # 用前几档盘口计算不平衡
+            self,
+            snapshot: dict,  # 当前行情快照
+            max_imbalance: float = 0.9,  # 最大允许盘口不平衡程度
+            depth: int = 5  # 用前几档盘口计算不平衡
     ) -> bool:
         """
         检查盘口买卖力量是否过度失衡。
         imbalance 接近 1 说明买盘远大于卖盘；
         imbalance 接近 -1 说明卖盘远大于买盘。
         """
-        bid_volumes = snapshot["bid_volumes"]            # 五档买盘挂单量
-        ask_volumes = snapshot["ask_volumes"]            # 五档卖盘挂单量
-        valid_depth = snapshot["valid_depth"]            # 当前有效深度
+        bid_volumes = snapshot["bid_volumes"]  # 五档买盘挂单量
+        ask_volumes = snapshot["ask_volumes"]  # 五档卖盘挂单量
+        valid_depth = snapshot["valid_depth"]  # 当前有效深度
 
         # 实际检查深度取最小值，避免访问无效盘口
         depth = min(depth, valid_depth, 5)
@@ -879,11 +900,11 @@ class QuoteRiskFilter:
         return abs(imbalance) <= max_imbalance
 
     def filter_by_position(
-        self,
-        buy_quotes: list[dict],   # 当前准备挂出的买单报价列表
-        sell_quotes: list[dict],  # 当前准备挂出的卖单报价列表
-        pos: float,               # 当前持仓，正数表示多头，负数表示空头
-        max_position: float       # 最大允许持仓
+            self,
+            buy_quotes: list[dict],  # 当前准备挂出的买单报价列表
+            sell_quotes: list[dict],  # 当前准备挂出的卖单报价列表
+            pos: float,  # 当前持仓，正数表示多头，负数表示空头
+            max_position: float  # 最大允许持仓
     ) -> tuple[list[dict], list[dict]]:
         """
         根据当前持仓过滤报价。
@@ -907,7 +928,8 @@ class QuoteRiskFilter:
         # 返回过滤后的买卖报价
         return buy_quotes, sell_quotes
 
-#库存控制，软对冲策略
+
+# 库存控制，软对冲策略
 class InventorySkewEngine:
     def __init__(self) -> None:  # 初始化库存偏移引擎对象
         self.last_skew_tick: int = 0  # 记录上一次报价偏移了多少个 tick
@@ -942,7 +964,6 @@ class InventorySkewEngine:
             self.last_pos_ratio = 0.0
             return buy_quotes, sell_quotes
 
-
         # 计算当前持仓占最大持仓的比例，范围在[-1, 1]之间
         pos_ratio = self.calculate_pos_ratio(pos, max_position)
 
@@ -956,7 +977,6 @@ class InventorySkewEngine:
         # 深拷贝买卖报价列表，避免修改原始数据，为后续价格调整做准备
         adjusted_buy_quotes = [quote.copy() for quote in buy_quotes]
         adjusted_sell_quotes = [quote.copy() for quote in sell_quotes]
-
 
         # 如果需要偏移的tick数大于0，根据持仓方向调整报价
         if skew_tick > 0:
@@ -997,11 +1017,11 @@ class InventorySkewEngine:
         # 返回经过库存偏移和被动限制处理后的最终报价
         return adjusted_buy_quotes, adjusted_sell_quotes
 
-    #计算持仓比例，将实际持仓标准化到[-1, 1]区间
+    # 计算持仓比例，将实际持仓标准化到[-1, 1]区间
     def calculate_pos_ratio(
-        self,
-        pos: float,
-        max_position: float,
+            self,
+            pos: float,
+            max_position: float,
     ) -> float:
 
         # 如果最大持仓限制无效，返回0表示无偏移
@@ -1023,9 +1043,9 @@ class InventorySkewEngine:
         return pos_ratio
 
     def calculate_skew_tick(
-        self,
-        pos_ratio: float,
-        max_skew_tick: int,
+            self,
+            pos_ratio: float,
+            max_skew_tick: int,
     ) -> int:
         """根据持仓比例计算需要偏移的tick数量"""
         # 如果最大偏移tick数无效，返回0表示不偏移
@@ -1036,10 +1056,10 @@ class InventorySkewEngine:
         return round(abs(pos_ratio) * max_skew_tick)
 
     def move_quotes(
-        self,
-        quotes: list[dict],
-        price_tick: float,
-        skew_tick: int,
+            self,
+            quotes: list[dict],
+            price_tick: float,
+            skew_tick: int,
     ) -> list[dict]:
         """对报价列表应用价格偏移"""
         adjusted_quotes: list[dict] = []
@@ -1064,13 +1084,11 @@ class InventorySkewEngine:
         # 返回调整后的报价列表（可能因价格无效而减少）
         return adjusted_quotes
 
-   
-   
     def apply_passive_limit(
-        self,
-        buy_quotes: list[dict],
-        sell_quotes: list[dict],
-        snapshot: dict,
+            self,
+            buy_quotes: list[dict],
+            sell_quotes: list[dict],
+            snapshot: dict,
     ) -> tuple[list[dict], list[dict]]:
         """应用被动挂单限制，确保报价不会主动吃单"""
         # 获取市场最优买卖价
@@ -1102,6 +1120,7 @@ class InventorySkewEngine:
 
         # 返回经过被动限制的买卖报价
         return adjusted_buy_quotes, adjusted_sell_quotes
+
     """
     #limit2 相当于虽然能保持档位间距，但会额外把报价推远，可能降低成交概率。 又重新算了一遍各档位，感觉有点过于保守了。
     def apply_passive_limit2(
@@ -1169,6 +1188,7 @@ class InventorySkewEngine:
         # 返回经过 passive 限制，并保持档位间距后的买卖报价
         return adjusted_buy_quotes, adjusted_sell_quotes
     """
+
     def get_last_skew_tick(self) -> int:
         """获取上一次应用的库存偏移tick数，用于监控和调试"""
         return self.last_skew_tick
@@ -1176,6 +1196,7 @@ class InventorySkewEngine:
     def get_last_pos_ratio(self) -> float:
         """获取上一次的持仓比例，用于监控当前库存风险程度"""
         return self.last_pos_ratio
+
 
 # hedge_engine.py
 class HedgeEngine:
@@ -1185,13 +1206,13 @@ class HedgeEngine:
         self.last_hedge_volume: float = 0.0
 
     def check_hedge(
-        self,
-        pos: float,
-        hedge_threshold: float,
-        hedge_volume: float,
-        price_tick: float,
-        snapshot: dict,
-        hedge_price_tick: int = 1,
+            self,
+            pos: float,
+            hedge_threshold: float,
+            hedge_volume: float,
+            price_tick: float,
+            snapshot: dict,
+            hedge_price_tick: int = 1,
     ) -> dict | None:
         if hedge_threshold <= 0:
             return None
@@ -1214,7 +1235,7 @@ class HedgeEngine:
                 price_tick=price_tick,
                 hedge_price_tick=hedge_price_tick,
             )
-            #abs为绝对值的意思
+            # abs为绝对值的意思
             volume = min(abs(pos), hedge_volume)
 
             hedge_order = {
@@ -1247,12 +1268,13 @@ class HedgeEngine:
             return hedge_order
 
         return None
-    #以略低于买一价的价格挂单，提高成交优先级，快速平掉多头仓位
+
+    # 以略低于买一价的价格挂单，提高成交优先级，快速平掉多头仓位
     def calculate_sell_close_price(
-        self,
-        bid1: float,
-        price_tick: float,
-        hedge_price_tick: int = 1,
+            self,
+            bid1: float,
+            price_tick: float,
+            hedge_price_tick: int = 1,
     ) -> float:
         if hedge_price_tick < 0:
             hedge_price_tick = 0
@@ -1263,12 +1285,13 @@ class HedgeEngine:
             return bid1
 
         return price
-    #以略高于卖一价的价格挂单，提高成交优先级，快速平掉空头仓位
+
+    # 以略高于卖一价的价格挂单，提高成交优先级，快速平掉空头仓位
     def calculate_buy_close_price(
-        self,
-        ask1: float,
-        price_tick: float,
-        hedge_price_tick: int = 1,
+            self,
+            ask1: float,
+            price_tick: float,
+            hedge_price_tick: int = 1,
     ) -> float:
         if hedge_price_tick < 0:
             hedge_price_tick = 0
@@ -1299,8 +1322,9 @@ class HedgeEngine:
         """获取最近一次强制平仓的数量"""
         return self.last_hedge_volume
 
+
 # 主策略, 继承CtaTemplate
-class OrderMarketMakerStrategy(CtaTemplate):
+class CancelAdvancedOrder(CtaTemplate):
     """Order模式通用做市策略"""
 
     author = "Morgan"
@@ -1344,8 +1368,6 @@ class OrderMarketMakerStrategy(CtaTemplate):
     use_ema_smoothing: bool = True
     ema_alpha: float = 0.2
 
-
-
     # =====================
     # 策略变量
     # =====================
@@ -1374,7 +1396,7 @@ class OrderMarketMakerStrategy(CtaTemplate):
     last_hedge_volume: float = 0.0
 
     hedging: bool = False
-    #这两个 list 是给 vn.py 的策略框架识别用的。
+    # 这两个 list 是给 vn.py 的策略框架识别用的。
     parameters = [
         "pricing_method",
         "pricing_depth",
@@ -1441,11 +1463,11 @@ class OrderMarketMakerStrategy(CtaTemplate):
     ]
 
     def __init__(
-        self,
-        cta_engine,
-        strategy_name: str,
-        vt_symbol: str,
-        setting: dict,
+            self,
+            cta_engine,
+            strategy_name: str,
+            vt_symbol: str,
+            setting: dict,
     ) -> None:
         super().__init__(cta_engine, strategy_name, vt_symbol, setting)
 
@@ -1565,8 +1587,8 @@ class OrderMarketMakerStrategy(CtaTemplate):
 
         # 深度检查
         if not self.quote_risk_filter.check_depth(
-            snapshot=snapshot,
-            min_depth=self.min_depth,
+                snapshot=snapshot,
+                min_depth=self.min_depth,
         ):
             self.cancel_market_making_orders()
             self.quote_engine.clear_current_quotes()
@@ -1575,9 +1597,9 @@ class OrderMarketMakerStrategy(CtaTemplate):
 
         # 价差检查
         if not self.quote_risk_filter.check_spread(
-            snapshot=snapshot,
-            price_tick=self.price_tick,
-            min_spread_tick=self.min_spread_tick,
+                snapshot=snapshot,
+                price_tick=self.price_tick,
+                min_spread_tick=self.min_spread_tick,
         ):
             self.cancel_market_making_orders()
             self.quote_engine.clear_current_quotes()
@@ -1586,9 +1608,9 @@ class OrderMarketMakerStrategy(CtaTemplate):
 
         # 深度挂单量检查
         if not self.quote_risk_filter.check_depth_volume(
-            snapshot=snapshot,
-            depth=self.depth_check_level,
-            min_depth_volume=self.min_depth_volume,
+                snapshot=snapshot,
+                depth=self.depth_check_level,
+                min_depth_volume=self.min_depth_volume,
         ):
             self.cancel_market_making_orders()
             self.quote_engine.clear_current_quotes()
@@ -1597,9 +1619,9 @@ class OrderMarketMakerStrategy(CtaTemplate):
 
         # 盘口不平衡检查
         if not self.quote_risk_filter.check_imbalance(
-            snapshot=snapshot,
-            max_imbalance=self.max_imbalance,
-            depth=self.depth_check_level,
+                snapshot=snapshot,
+                max_imbalance=self.max_imbalance,
+                depth=self.depth_check_level,
         ):
             self.cancel_market_making_orders()
             self.quote_engine.clear_current_quotes()
@@ -1669,10 +1691,10 @@ class OrderMarketMakerStrategy(CtaTemplate):
 
         # 判断是否需要撤单重挂
         if not self.quote_engine.need_requote(
-            new_buy_quotes=buy_quotes,
-            new_sell_quotes=sell_quotes,
-            price_tick=self.price_tick,
-            update_tolerance=self.update_tolerance,
+                new_buy_quotes=buy_quotes,
+                new_sell_quotes=sell_quotes,
+                price_tick=self.price_tick,
+                update_tolerance=self.update_tolerance,
         ):
             self.put_event()
             return
