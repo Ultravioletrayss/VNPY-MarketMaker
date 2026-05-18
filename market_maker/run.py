@@ -35,7 +35,7 @@ from vnpy_datamanager import DataManagerApp
 # from vnpy_webtrader import WebTraderApp
 # from vnpy_portfoliomanager import PortfolioManagerApp
 from vnpy_datarecorder import DataRecorderApp
-
+from vnpy_paperaccount import PaperAccountApp
 def main():
     """"""
     qapp = create_qapp()
@@ -60,7 +60,7 @@ def main():
     # main_engine.add_gateway(RohonGateway)
     # main_engine.add_gateway(TtsGateway)
 
-    # main_engine.add_app(PaperAccountApp)
+    main_engine.add_app(PaperAccountApp)
     main_engine.add_app(CtaStrategyApp)
     main_engine.add_app(CtaBacktesterApp)
     # main_engine.add_app(SpreadTradingApp)
