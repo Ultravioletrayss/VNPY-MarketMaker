@@ -1,72 +1,276 @@
-以下是为您更新的 **`QuoteRiskFilter` 报价风控过滤器 API 规范文档**。新增的盘口量能与失衡度校验已纳入标准风控矩阵，文档保持与前序一致的工程化结构。
+# 🛡️ `QuoteRiskFilter`（报价风控过滤模块）
 
----
-## 🛡️ `QuoteRiskFilter` (报价风控过滤器)
-**架构定位**：无状态盘口风控组件（Stateless Pre-Trade Filter），专用于做市/高频报价策略的 `行情清洗 → 报价生成 → 敞口控制` 链路。所有方法纯函数化，线程安全，可直接嵌入行情推送钩子或报价引擎前置校验。
+**架构定位**：报价前置风控模块。负责判断当前行情是否适合做市，并根据当前持仓限制过滤报价。
 
-### 📋 核心方法速查
-| 方法名 | 参数类型 | 返回值 | 作用说明 |
-|:---|:---|:---|:---|
-| `check_market_data` | `snapshot: dict` | `bool` | 📉 **基础有效性校验**。检查买卖一价/量 `>0` 且 `ask1 > bid1`（防盘口倒挂/交叉）。任一异常阻断报价 |
-| `check_depth` | `snapshot: dict`, `min_depth: int=1` | `bool` | 🌊 **深度层数校验**。验证 `valid_depth` 是否 `≥ min_depth`，过滤流动性枯竭或交易所断流状态 |
-| `check_depth_volume` | `snapshot: dict`, `depth: int=5`, `min_depth_volume: float=1` | `bool` | 📦 **指定深度累计流动性校验**。计算前 `depth` 档买卖盘总量，若任一侧低于阈值返回 `False`，防薄盘滑点与瞬间击穿 |
-| `check_spread` | `snapshot: dict`, `price_tick: float`, `min_spread_tick: int` | `bool` | 📏 **价差跳数校验**。将绝对价差换算为跳数，低于设定阈值返回 `False`，控制低波动环境下的做市成本 |
-| `check_imbalance` | `snapshot: dict`, `max_imbalance: float=0.9`, `depth: int=5` | `bool` | ⚖️ **盘口买卖失衡度校验**。计算 `(bid_sum - ask_sum) / total`，若绝对值超阈值返回 `False`，防范单边碾压或主力扫盘行情 |
-| `filter_by_position` | `buy_quotes: list[dict]`, `sell_quotes: list[dict]`, `pos: float`, `max_position: float` | `tuple[list[dict], list[dict]]` | 🚧 **持仓限额过滤**。根据净持仓 `pos` 与上限 `max_position` 动态清空单边报价队列，严格控制策略敞口风险 |
+在做市策略中，策略不会在任何行情下都无条件挂单。如果盘口异常、深度不足、价差太小、盘口太薄，或者买卖盘严重失衡，继续报价可能会带来较高风险。因此，`QuoteRiskFilter` 相当于策略发单前的安全检查层。
 
----
-### 📦 `snapshot` 数据契约规范
-风控方法依赖统一的市场快照结构，调用前需确保行情网关或数据聚合层已注入以下字段：
+简单来说，它主要回答两个问题：
 
-| 字段名 | 类型 | 说明 | 依赖方法 |
-|:---|:---|:---|:---|
-| `bid1`, `ask1` | `float` | 买卖一价 | `check_market_data`, `check_spread` |
-| `bid1_volume`, `ask1_volume` | `float` | 买卖一量 | `check_market_data` |
-| `valid_depth` | `int` | 交易所推送的有效盘口层数 | `check_depth`, `check_depth_volume`, `check_imbalance` |
-| `market_spread` | `float` | 绝对价差 (`ask1 - bid1`) | `check_spread` |
-| `bid_volumes` | `list[float]` | 多档买盘量列表（建议长度≥5） | `check_depth_volume`, `check_imbalance` |
-| `ask_volumes` | `list[float]` | 多档卖盘量列表（建议长度≥5） | `check_depth_volume`, `check_imbalance` |
-
----
-### 💡 核心风控逻辑与调优指南
-
-1. **安全截断机制 `min(depth, valid_depth, 5)`**  
-   `check_depth_volume` 与 `check_imbalance` 均内置三重截断：  
-   ✅ 用户设定值 `depth`  
-   ✅ 交易所实际深度 `valid_depth`  
-   ✅ 硬编码上限 `5`（防数组越界与性能衰减）  
-   📌 **开发建议**：上游 `snapshot` 组装时，`bid_volumes`/`ask_volumes` 长度若不足 5，建议用 `0.0` 填充对齐，避免切片索引异常。
-
-2. **失衡度阈值 `max_imbalance` 调参逻辑**  
-   - `0.9` 表示允许单侧量能占比达 `95%`（`(1+0.9)/2`），属**宽松过滤**，适合趋势跟踪或宽频做市。  
-   - 若用于**中性做市/网格**，建议降至 `0.6~0.75`，提前规避主力单侧扫盘导致的库存倾斜。  
-   - 可结合波动率动态调整：`max_imbalance = base_threshold * (1 - vol_ratio)`。
-
-3. **量能阈值 `min_depth_volume` 与合约适配**  
-   该值为绝对手数/张数，需按合约乘数与流动性分层配置：  
-   - 主力合约（如 IF/IC/螺纹）：`10~50`  
-   - 次主力/小品种：`1~5`  
-   - 期权/微盘股：`0.1~1`（注意浮点精度）
-
-4. **报价过滤不修改原对象**  
-   `filter_by_position` 返回新列表引用，**不执行就地清空**。若需高性能内存复用，可在调用方使用：
-   ```python
-   buy_quotes.clear() if pos >= max_position else None
-   ```
-
----
-### 🔄 典型报价风控流水线
 ```text
-on_tick(tick) 
-  → 组装 snapshot (填充 bid/ask_volumes, valid_depth, market_spread)
-  → risk.check_market_data(snapshot)          # 基础有效性
-  → risk.check_depth(snapshot, min_depth=2)   # 流动性层数
-  → risk.check_depth_volume(snapshot, min_depth_volume=5.0) # 盘口厚度
-  → risk.check_imbalance(snapshot, max_imbalance=0.7)       # 防单边碾压
-  → risk.check_spread(snapshot, pricetick, min_spread=2)    # 成本保护
-  → 生成 buy_quotes / sell_quotes
-  → buy, sell = risk.filter_by_position(buy, sell, pos, max_pos) # 敞口控制
-  → 提交至报价引擎 / Gateway
+当前行情适不适合做市？
+当前仓位还允不允许继续挂这一边的单？
+````
+
+---
+
+## 📋 核心方法速查
+
+| 方法名                  | 参数类型                                                                                     | 返回值                             | 作用说明               |
+| :------------------- | :--------------------------------------------------------------------------------------- | :------------------------------ | :----------------- |
+| `check_market_data`  | `snapshot: dict`                                                                         | `bool`                          | 检查基础买一卖一盘口是否合法     |
+| `check_depth`        | `snapshot: dict`, `min_depth: int=1`                                                     | `bool`                          | 检查当前有效盘口深度是否达到最低要求 |
+| `check_spread`       | `snapshot: dict`, `price_tick: float`, `min_spread_tick: int`                            | `bool`                          | 检查当前买卖价差是否足够       |
+| `check_depth_volume` | `snapshot: dict`, `depth: int=5`, `min_depth_volume: float=1`                            | `bool`                          | 检查前 N 档买卖盘挂单量是否充足  |
+| `check_imbalance`    | `snapshot: dict`, `max_imbalance: float=0.9`, `depth: int=5`                             | `bool`                          | 检查盘口买卖力量是否过度失衡     |
+| `filter_by_position` | `buy_quotes: list[dict]`, `sell_quotes: list[dict]`, `pos: float`, `max_position: float` | `tuple[list[dict], list[dict]]` | 根据当前持仓过滤会继续加仓的一边报价 |
+
+---
+
+## 📦 输入数据：`snapshot`
+
+`QuoteRiskFilter` 主要依赖 `MarketDataManager` 生成的 `snapshot` 行情快照。
+
+常用字段包括：
+
+| 字段名             | 类型            | 说明                        |
+| :-------------- | :------------ | :------------------------ |
+| `bid1`          | `float`       | 当前买一价                     |
+| `ask1`          | `float`       | 当前卖一价                     |
+| `bid1_volume`   | `float`       | 当前买一挂单量                   |
+| `ask1_volume`   | `float`       | 当前卖一挂单量                   |
+| `market_spread` | `float`       | 当前买卖价差，通常等于 `ask1 - bid1` |
+| `valid_depth`   | `int`         | 当前有效盘口深度                  |
+| `bid_volumes`   | `list[float]` | 买一到买五挂单量                  |
+| `ask_volumes`   | `list[float]` | 卖一到卖五挂单量                  |
+
+---
+
+## 💡 核心过滤逻辑
+
+### 1. 基础盘口检查：`check_market_data()`
+
+`check_market_data()` 用于检查最基础的买一卖一数据是否合法。
+
+检查条件是：
+
+```text
+bid1 > 0
+ask1 > 0
+ask1 > bid1
+bid1_volume > 0
+ask1_volume > 0
 ```
 
-> 📌 此规范已同步您新增的 `check_depth_volume` 与 `check_imbalance` 逻辑。如需生成对应的 `pytest` 边界测试用例、接入 `vnpy` 的 `CtaTemplate` 回调封装，或需将风控参数外置为 YAML/JSON 配置加载模板，可提供具体集成场景。
+如果这些条件中任意一个不满足，说明当前盘口数据异常，策略不会继续报价。
+
+例如：
+
+```text
+ask1 <= bid1
+```
+
+说明买卖价关系异常，可能是行情数据错误、盘口断流，或者当前不是正常交易状态。
+
+---
+
+### 2. 有效深度检查：`check_depth()`
+
+`check_depth()` 用来判断当前盘口有效深度是否达到最低要求。
+
+核心判断是：
+
+```text
+valid_depth >= min_depth
+```
+
+其中：
+
+| 参数            | 含义          |
+| :------------ | :---------- |
+| `valid_depth` | 当前实际有效盘口深度  |
+| `min_depth`   | 策略要求的最小盘口深度 |
+
+例如：
+
+```text
+min_depth = 3
+```
+
+表示当前盘口至少需要有 3 档有效买卖盘，策略才允许继续报价。
+
+如果盘口深度不足，说明当前流动性不够，策略容易在较薄盘口中被快速成交或被价格打穿。
+
+---
+
+### 3. 买卖价差检查：`check_spread()`
+
+`check_spread()` 用来判断当前买卖价差是否达到最低要求。
+
+计算逻辑是：
+
+```text
+spread_tick = market_spread / price_tick
+```
+
+其中：
+
+```text
+market_spread = ask1 - bid1
+```
+
+然后判断：
+
+```text
+spread_tick >= min_spread_tick
+```
+
+参数含义如下：
+
+| 参数                | 含义              |
+| :---------------- | :-------------- |
+| `market_spread`   | 当前买卖价差          |
+| `price_tick`      | 合约最小变动价位        |
+| `spread_tick`     | 当前价差折算成多少个 tick |
+| `min_spread_tick` | 最小价差要求          |
+
+如果价差太小，做市空间不足，策略就不会报价。
+
+这个过滤的意义是避免在价差过窄时做市，因为价差可能不足以覆盖手续费、滑点和被动成交风险。
+
+---
+
+### 4. 盘口挂单量检查：`check_depth_volume()`
+
+`check_depth_volume()` 用来检查前 N 档买卖盘总挂单量是否足够。
+
+它会分别计算：
+
+```text
+bid_volume_sum = sum(bid_volumes[:depth])
+ask_volume_sum = sum(ask_volumes[:depth])
+```
+
+然后判断：
+
+```text
+bid_volume_sum >= min_depth_volume
+ask_volume_sum >= min_depth_volume
+```
+
+其中，实际检查深度会取：
+
+```text
+depth = min(depth, valid_depth, 5)
+```
+
+这样可以避免检查超过实际有效盘口的数据。
+
+如果买盘或卖盘挂单量太小，说明盘口较薄，市场流动性不足，策略会停止报价。
+
+---
+
+### 5. 盘口不平衡检查：`check_imbalance()`
+
+`check_imbalance()` 用于判断买卖盘是否过度失衡。
+
+计算公式是：
+
+```text
+imbalance = (bid_volume_sum - ask_volume_sum) / (bid_volume_sum + ask_volume_sum)
+```
+
+含义是：
+
+```text
+imbalance > 0：买盘更厚
+imbalance < 0：卖盘更厚
+imbalance 接近 1：买盘远大于卖盘
+imbalance 接近 -1：卖盘远大于买盘
+```
+
+最后判断：
+
+```text
+abs(imbalance) <= max_imbalance
+```
+
+如果 `abs(imbalance)` 超过 `max_imbalance`，说明盘口一边倒，短期价格可能存在明显方向性风险，策略不会继续报价。
+
+---
+
+## ⚖️ 仓位过滤逻辑：`filter_by_position()`
+
+`filter_by_position()` 用来根据当前持仓过滤报价。
+
+它不是判断行情，而是判断当前仓位是否还允许继续挂某一边订单。
+
+逻辑是：
+
+```text
+如果 pos >= max_position：
+    删除 buy_quotes
+
+如果 pos <= -max_position：
+    删除 sell_quotes
+```
+
+其中：
+
+| 参数             | 含义                  |
+| :------------- | :------------------ |
+| `pos`          | 当前净持仓，正数表示多头，负数表示空头 |
+| `max_position` | 最大允许持仓              |
+| `buy_quotes`   | 当前准备挂出的买单报价         |
+| `sell_quotes`  | 当前准备挂出的卖单报价         |
+
+例如：
+
+```text
+pos = 4
+max_position = 4
+```
+
+说明当前多头已经达到上限，此时不能继续挂买单，否则买单成交后会让多头仓位继续扩大。因此代码会清空 `buy_quotes`。
+
+如果：
+
+```text
+pos = -4
+max_position = 4
+```
+
+说明当前空头已经达到上限，此时不能继续挂卖单，否则卖单成交后会让空头仓位继续扩大。因此代码会清空 `sell_quotes`。
+
+---
+
+## ⚙️ 参数调节含义
+
+| 参数                  | 作用           | 调大/调小影响                       |
+| :------------------ | :----------- | :---------------------------- |
+| `min_depth`         | 最小有效盘口深度     | 调大：过滤更严格，只在盘口更深时报价；调小：允许浅盘口报价 |
+| `min_spread_tick`   | 最小买卖价差要求     | 调大：只在价差更宽时报价；调小：允许更窄价差下报价     |
+| `depth_check_level` | 检查前几档盘口      | 调大：参考更多档盘口；调小：更关注近端盘口         |
+| `min_depth_volume`  | 前 N 档最小挂单量要求 | 调大：要求盘口更厚；调小：允许较薄盘口报价         |
+| `max_imbalance`     | 最大允许盘口失衡程度   | 调大：更宽松，容忍更强失衡；调小：更严格，过滤一边倒盘口  |
+| `max_position`      | 最大允许净持仓      | 调大：允许更大库存风险；调小：仓位控制更保守        |
+
+---
+
+## ✅ 小结
+
+`QuoteRiskFilter` 是策略发单前的风控过滤层。
+
+它主要完成两件事：
+
+```text
+1. 判断当前行情是否适合做市；
+2. 判断当前持仓是否允许继续挂某一边报价。
+```
+
+如果行情检查不通过，主策略会撤销普通做市单并停止报价。
+如果仓位达到上限，模块会删除可能继续扩大风险仓位的一边报价。
+
+因此，`QuoteRiskFilter` 是连接行情质量判断和仓位风险控制的关键模块。
+
+```
+```

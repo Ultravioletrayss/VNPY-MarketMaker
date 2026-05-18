@@ -1,94 +1,329 @@
-以下是为您整理的 **`HedgeEngine` 自动对冲/硬风控引擎 API 规范文档**。该类是策略风险管理的最后一道防线，负责在库存偏移失效或行情单边突破时，强制触发平仓指令。
+
+# 🚨 `HedgeEngine`（强制平仓 / 硬风控模块）
+
+**架构定位**：强制风险控制模块。负责在当前持仓超过设定阈值时，生成强制平仓指令。
+
+它和 `InventorySkewEngine` 的区别是：
+
+```text
+InventorySkewEngine：通过调整报价实现软对冲
+HedgeEngine：通过生成平仓指令实现硬风控
+````
+
+也就是说，`InventorySkewEngine` 是让策略尽量通过正常挂单慢慢降低库存；而 `HedgeEngine` 是当仓位已经超过风险阈值时，直接生成平仓动作，主动降低风险暴露。
 
 ---
-## 🛡️ `HedgeEngine` (自动对冲/硬风控引擎)
-**架构定位**：独立风控执行模块。监控净持仓绝对值，当突破硬性阈值时，生成主动吃单(Taker)平仓指令。与 `InventorySkewEngine`（软对冲/引导减仓）形成 **“被动调节 + 主动平仓”** 的双层风控体系，确保极端行情下敞口可控。
 
-### 📋 核心方法速查
-| 方法名 | 参数类型 | 返回值 | 作用说明 |
-|:---|:---|:---|:---|
-| `__init__` | *(无)* | `None` | 初始化状态缓存：`last_hedge_action=""`, `last_hedge_price=0.0`, `last_hedge_volume=0.0` |
-| `check_hedge` | `pos: float`, `hedge_threshold: float`, `hedge_volume: float`, `price_tick: float`<br>`snapshot: dict`, `hedge_price_tick: int=1` | `dict \| None` | 🚨 **核心触发器**。检查持仓是否超阈值，计算对冲价量。若触发返回指令字典，否则返回 `None` |
-| `calculate_sell_close_price` | `bid1: float`, `price_tick: float`, `hedge_price_tick: int=1` | `float` | 📉 **空头平仓/多头减仓定价**。`bid1 - offset`，生成保证成交的限价单（Marketable Limit Order） |
-| `calculate_buy_close_price` | `ask1: float`, `price_tick: float`, `hedge_price_tick: int=1` | `float` | 📈 **多头平仓/空头回补定价**。`ask1 + offset`，穿透卖一价确保快速成交 |
-| `update_last_hedge` | `hedge_order: dict` | `None` | 💾 更新最近一次对冲动作的状态缓存（内部自动调用） |
-| `clear_last_hedge` | *(无)* | `None` | 🧹 清空对冲状态缓存，策略重启或日终结算时调用 |
-| `get_last_hedge_*` | *(无)* | `str` / `float` | 🔍 获取最近一次对冲的动作类型、价格、成交量（供UI/日志监控） |
+## 📋 核心方法速查
 
----
-### 📦 对冲指令字典结构 (`Hedge Order Dict`)
-`check_hedge` 触发时返回的标准指令结构，下游可直接映射为 `OrderData` 或发送至交易网关：
-
-| 字段名 | 类型 | 说明 |
-|:---|:---|:---|
-| `action` | `str` | `"SELL_CLOSE"`（平多/空开） 或 `"BUY_CLOSE"`（平空/多开） |
-| `price` | `float` | 已对齐合约规格的主动平仓价格 |
-| `volume` | `float` | 实际对冲数量（`min(abs(pos), hedge_volume)`） |
-| `reason` | `str` | 触发原因标识（如 `"long_position_exceed_threshold"`） |
+| 方法名                          | 参数类型                                                                                                                            | 返回值            | 作用说明                                                                   |
+| :--------------------------- | :------------------------------------------------------------------------------------------------------------------------------ | :------------- | :--------------------------------------------------------------------- |
+| `__init__`                   | 无                                                                                                                               | `None`         | 初始化强制平仓状态缓存：`last_hedge_action`、`last_hedge_price`、`last_hedge_volume` |
+| `check_hedge`                | `pos: float`, `hedge_threshold: float`, `hedge_volume: float`, `price_tick: float`, `snapshot: dict`, `hedge_price_tick: int=1` | `dict \| None` | 核心触发函数。检查持仓是否超过阈值，若触发则返回强制平仓指令                                         |
+| `calculate_sell_close_price` | `bid1: float`, `price_tick: float`, `hedge_price_tick: int=1`                                                                   | `float`        | 多头超限时，计算卖出平仓价格                                                         |
+| `calculate_buy_close_price`  | `ask1: float`, `price_tick: float`, `hedge_price_tick: int=1`                                                                   | `float`        | 空头超限时，计算买入平仓价格                                                         |
+| `update_last_hedge`          | `hedge_order: dict`                                                                                                             | `None`         | 更新最近一次强制平仓动作、价格和数量                                                     |
+| `clear_last_hedge`           | 无                                                                                                                               | `None`         | 清空强制平仓状态缓存                                                             |
+| `get_last_hedge_action`      | 无                                                                                                                               | `str`          | 获取最近一次强制平仓方向                                                           |
+| `get_last_hedge_price`       | 无                                                                                                                               | `float`        | 获取最近一次强制平仓价格                                                           |
+| `get_last_hedge_volume`      | 无                                                                                                                               | `float`        | 获取最近一次强制平仓数量                                                           |
 
 ---
-### 💡 核心逻辑与实盘调优指南
 
-1. **软对冲 vs 硬对冲 分工边界**
-   | 模块 | 机制 | 订单类型 | 适用场景 |
-   |:---|:---|:---|:---|
-   | `InventorySkewEngine` | 价格偏移引导成交 | Maker（挂单） | 日常库存管理，赚取点差/返佣 |
-   | `HedgeEngine` | 阈值触发强制平仓 | Taker（吃单） | 极端行情/单边突破/软对冲失效时的硬止损 |
+## 📦 输入参数说明
 
-2. **参数联动设置建议**
-   - `hedge_threshold` **必须小于** `max_position`。建议：`hedge_threshold = max_position × 0.6 ~ 0.8`，为软对冲预留缓冲空间。
-   - `hedge_volume` 建议设为策略常规单量的 `50% ~ 100%`。过大易引发冲击成本，过小则需多次触发。
-   - `hedge_price_tick` 控制侵略性：`1` = 吃一价（高成交率，低滑点），`2~3` = 穿透多档（极端行情保成交），`0` = 挂一价（不推荐，对冲可能挂单不成交）。
+`check_hedge()` 是本模块最核心的方法，主要输入如下：
 
-3. **循环执行机制**  
-   `check_hedge` **单次仅生成一笔指令**。若 `pos` 远超阈值（如 `pos=10, hedge_volume=2`），主策略需在 `on_tick` 或定时任务中**循环调用**，直至 `pos < hedge_threshold`。
+| 参数                 | 类型      | 说明                          |
+| :----------------- | :------ | :-------------------------- |
+| `pos`              | `float` | 当前净持仓，正数表示多头，负数表示空头         |
+| `hedge_threshold`  | `float` | 强制平仓触发阈值                    |
+| `hedge_volume`     | `float` | 每次强制平仓的最大数量                 |
+| `price_tick`       | `float` | 合约最小变动价位                    |
+| `snapshot`         | `dict`  | 当前行情快照，主要使用 `bid1` 和 `ask1` |
+| `hedge_price_tick` | `int`   | 强制平仓价格相对盘口偏移的 tick 数        |
 
-4. **防御性设计**
-   - 盘口有效性检查：`bid1 <= 0 or ask1 <= 0 or ask1 <= bid1` 时直接返回 `None`，防止在集合竞价/停牌/断流期间误发对冲单。
-   - 价格保护：`calculate_sell_close_price` 内置 `if price <= 0: return bid1`，防负价格废单。
-   - 状态缓存仅用于外部监控，**不参与**内部风控判断，保证引擎无副作用。
+函数会先做参数和盘口检查。如果以下条件不满足，则直接返回 `None`：
+
+```text
+hedge_threshold > 0
+hedge_volume > 0
+price_tick > 0
+bid1 > 0
+ask1 > 0
+ask1 > bid1
+```
+
+这样可以避免在参数错误或盘口异常时误触发强制平仓。
 
 ---
-### 🔄 标准调用流水线 (Pipeline)
-对冲引擎通常独立于报价流水线，建议在 `on_tick` 末尾或独立心跳循环中执行：
+
+## 💡 核心触发逻辑
+
+### 1. 多头超限：生成 `SELL_CLOSE`
+
+如果当前持仓满足：
+
+```text
+pos >= hedge_threshold
+```
+
+说明策略当前多头仓位过大，需要卖出平仓。
+
+此时 `check_hedge()` 会生成：
+
+```text
+SELL_CLOSE
+```
+
+也就是卖出平多指令。
+
+对应返回结构：
 
 ```python
-# 1. 执行常规报价逻辑 (Pricing -> Quote -> Skew -> Filter)
-# ... (略)
-
-# 2. 硬风控检查 (HedgeEngine)
-hedge_order = self.hedge_engine.check_hedge(
-    pos=self.pos,
-    hedge_threshold=self.hedge_threshold,
-    hedge_volume=self.hedge_volume,
-    price_tick=self.price_tick,
-    snapshot=snapshot,
-    hedge_price_tick=self.hedge_price_tick,
-)
-
-# 3. 触发平仓执行
-if hedge_order:
-    if hedge_order["action"] == "SELL_CLOSE":
-        self.sell(price=hedge_order["price"], volume=hedge_order["volume"])
-    elif hedge_order["action"] == "BUY_CLOSE":
-        self.cover(price=hedge_order["price"], volume=hedge_order["volume"])
-    
-    self.write_log(f"[硬风控] 触发对冲: {hedge_order['reason']} | 价:{hedge_order['price']} 量:{hedge_order['volume']}")
+{
+    "action": "SELL_CLOSE",
+    "price": price,
+    "volume": volume,
+    "reason": "long_position_exceed_threshold",
+}
 ```
 
 ---
-### ⚙️ 主策略配置扩展
-需在策略类中声明参数并加入监控列表：
-```python
-class MyMarketMaker(CtaTemplate):
-    parameters = [
-        "hedge_threshold",
-        "hedge_volume",
-        "hedge_price_tick",
-    ]
-    hedge_threshold: float = 5.0      # 触发硬对冲的持仓绝对值阈值
-    hedge_volume: float = 2.0         # 单笔对冲执行数量
-    hedge_price_tick: int = 1         # 对冲价格穿透跳数
+
+### 2. 空头超限：生成 `BUY_CLOSE`
+
+如果当前持仓满足：
+
+```text
+pos <= -hedge_threshold
 ```
 
-> 📌 此规范已完整对齐 `HedgeEngine` 的触发逻辑、定价模型与状态管理。如需增加 **动态阈值（基于ATR/波动率调整）**、**分批对冲队列管理**，或与前序模块整合为完整的 `MarketMakerPipeline` 架构，可提供具体需求。文档结构已优化为标准 Markdown，PyCharm 可直接渲染预览。
+说明策略当前空头仓位过大，需要买入平仓。
+
+此时 `check_hedge()` 会生成：
+
+```text
+BUY_CLOSE
+```
+
+也就是买入平空指令。
+
+对应返回结构：
+
+```python
+{
+    "action": "BUY_CLOSE",
+    "price": price,
+    "volume": volume,
+    "reason": "short_position_exceed_threshold",
+}
+```
+
+---
+
+## 📉 平多价格计算：`calculate_sell_close_price()`
+
+当多头超限时，策略需要卖出平仓。
+平多价格由 `calculate_sell_close_price()` 计算：
+
+```text
+price = bid1 - hedge_price_tick * price_tick
+```
+
+其中：
+
+| 参数                 | 含义               |
+| :----------------- | :--------------- |
+| `bid1`             | 当前买一价            |
+| `hedge_price_tick` | 相对买一价向下偏移几个 tick |
+| `price_tick`       | 合约最小变动价位         |
+
+例如：
+
+```text
+bid1 = 3700
+price_tick = 1
+hedge_price_tick = 1
+
+price = 3700 - 1 * 1 = 3699
+```
+
+这样做的目的是让平多单价格略低于买一价，提高成交概率，从而尽快降低多头仓位。
+
+如果计算出来的价格小于等于 0，代码会返回 `bid1`，防止出现非法价格。
+
+---
+
+## 📈 平空价格计算：`calculate_buy_close_price()`
+
+当空头超限时，策略需要买入平仓。
+平空价格由 `calculate_buy_close_price()` 计算：
+
+```text
+price = ask1 + hedge_price_tick * price_tick
+```
+
+其中：
+
+| 参数                 | 含义               |
+| :----------------- | :--------------- |
+| `ask1`             | 当前卖一价            |
+| `hedge_price_tick` | 相对卖一价向上偏移几个 tick |
+| `price_tick`       | 合约最小变动价位         |
+
+例如：
+
+```text
+ask1 = 3702
+price_tick = 1
+hedge_price_tick = 1
+
+price = 3702 + 1 * 1 = 3703
+```
+
+这样做的目的是让平空单价格略高于卖一价，提高成交概率，从而尽快降低空头仓位。
+
+---
+
+## 📦 强制平仓数量控制
+
+强制平仓数量不是直接等于当前全部持仓，而是：
+
+```text
+volume = min(abs(pos), hedge_volume)
+```
+
+含义是：
+
+| 情况                         | 说明                    |
+| :------------------------- | :-------------------- |
+| `abs(pos) > hedge_volume`  | 本次最多只平 `hedge_volume` |
+| `abs(pos) <= hedge_volume` | 本次最多平掉当前实际持仓          |
+
+例如：
+
+```text
+pos = 5
+hedge_volume = 2
+
+volume = min(5, 2) = 2
+```
+
+表示当前虽然有 5 手持仓，但本次只平 2 手。
+
+再比如：
+
+```text
+pos = 1
+hedge_volume = 2
+
+volume = min(1, 2) = 1
+```
+
+表示当前只有 1 手持仓，因此本次最多只能平 1 手。
+
+---
+
+## 📦 强制平仓指令字典结构
+
+`check_hedge()` 触发时返回的是一个字典，而不是直接发单。
+
+结构如下：
+
+| 字段名      | 类型      | 说明                                                                               |
+| :------- | :------ | :------------------------------------------------------------------------------- |
+| `action` | `str`   | `"SELL_CLOSE"` 表示卖出平多；`"BUY_CLOSE"` 表示买入平空                                       |
+| `price`  | `float` | 强制平仓价格                                                                           |
+| `volume` | `float` | 实际平仓数量，等于 `min(abs(pos), hedge_volume)`                                          |
+| `reason` | `str`   | 触发原因，例如 `"long_position_exceed_threshold"` 或 `"short_position_exceed_threshold"` |
+
+这个字典只是内部信号。真正下单是在主策略里完成：
+
+```text
+SELL_CLOSE → 主策略调用 sell()
+BUY_CLOSE  → 主策略调用 cover()
+```
+
+---
+
+## 🗂️ 状态缓存
+
+`HedgeEngine` 内部记录最近一次强制平仓信息：
+
+```text
+last_hedge_action
+last_hedge_price
+last_hedge_volume
+```
+
+| 变量                  | 含义         |
+| :------------------ | :--------- |
+| `last_hedge_action` | 最近一次强制平仓方向 |
+| `last_hedge_price`  | 最近一次强制平仓价格 |
+| `last_hedge_volume` | 最近一次强制平仓数量 |
+
+对应方法：
+
+| 方法                        | 作用                |
+| :------------------------ | :---------------- |
+| `update_last_hedge()`     | 在生成强制平仓指令后，更新状态缓存 |
+| `clear_last_hedge()`      | 清空强制平仓状态缓存        |
+| `get_last_hedge_action()` | 获取最近一次强制平仓方向      |
+| `get_last_hedge_price()`  | 获取最近一次强制平仓价格      |
+| `get_last_hedge_volume()` | 获取最近一次强制平仓数量      |
+
+这些状态主要用于 UI 展示、日志监控和调试。
+
+---
+
+## ⚙️ 参数调节含义
+
+| 参数                 | 作用                | 调大/调小影响                        |
+| :----------------- | :---------------- | :----------------------------- |
+| `hedge_threshold`  | 强制平仓触发阈值          | 调大：更晚触发强制平仓；调小：更早触发强制平仓        |
+| `hedge_volume`     | 每次强制平仓最大数量        | 调大：平仓更快，但冲击更大；调小：平仓更温和，但恢复仓位更慢 |
+| `hedge_price_tick` | 平仓价格相对盘口偏移 tick 数 | 调大：更容易成交，但滑点更大；调小：更保守，但可能不容易成交 |
+| `price_tick`       | 合约最小变动价位          | 决定每个 hedge tick 对应的真实价格距离      |
+
+### 参数联动建议
+
+一般情况下：
+
+```text
+hedge_threshold < max_position
+```
+
+这样可以在仓位达到最大持仓限制之前，提前触发强制平仓。
+
+例如：
+
+```text
+max_position = 4
+hedge_threshold = 3
+```
+
+表示最大允许持仓为 4 手，但当持仓达到 3 手时，就开始强制平仓，避免仓位继续逼近上限。
+
+---
+
+## ✅ 小结
+
+`HedgeEngine` 是策略中的硬风控模块。
+
+它主要回答一个问题：
+
+```text
+当前持仓是否已经超过强制平仓阈值？如果超过，应该以什么方向、什么价格、多少数量进行平仓？
+```
+
+它和 `InventorySkewEngine` 构成双层库存控制：
+
+| 模块                    | 控制方式   | 是否直接平仓 | 作用                 |
+| :-------------------- | :----- | :----- | :----------------- |
+| `InventorySkewEngine` | 调整报价   | 否      | 日常库存管理，通过报价实现软对冲   |
+| `HedgeEngine`         | 生成平仓指令 | 是      | 极端情况下的硬风控，主动降低风险暴露 |
+
+因此，当软库存偏移无法及时控制仓位时，`HedgeEngine` 会作为最后一层保护，触发强制平仓逻辑。
+
+

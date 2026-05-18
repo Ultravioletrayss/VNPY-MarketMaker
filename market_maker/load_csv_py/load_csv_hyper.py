@@ -10,7 +10,7 @@ from vnpy.trader.database import get_database
 
 CHINA_TZ = ZoneInfo("Asia/Shanghai")
 
-# 改成你的完整 CSV 文件路径
+# 改成完整 CSV 文件路径
 CSV_FILE_PATH = r"C:\Users\ultra\Desktop\CSV_DATA\RB2505.03.csv"
 
 # 只导入 RB / FU，避免误导入其他品种
